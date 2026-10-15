@@ -5946,7 +5946,7 @@ App.hpGo=(id,mode)=>{ const H=HPT[HP_LINK[id]&&HPT[HP_LINK[id]]?HP_LINK[id]:id]|
     if(HPB[id]&&HPB[id].start){ const [a,b]=HPB[id].start; sx=H.x+a; sz=H.z+b; } else
     find: for(const r of [R0,R0*.7,R0*.45,R0*.25,8]) for(let k=0;k<16;k++){ const a=k/16*6.28; const x=H.x+Math.sin(a)*r, z=H.z+Math.cos(a)*r; if(free(x,z)){ sx=x; sz=z; break find; } }
     placeAt({x:sx, z:sz, yaw:yawToward(sx,sz,H.x,H.z)}); }
-  rtFlush(camera.position,2500); sitesUpdate(true); cellsUpdate(true); routesUpdate(true); };
+  rtFlush(camera.position,2500); sitesUpdate(true); cellsUpdate(true); routesUpdate(true); App.aqHold(4); };
 
 /* ================= The places panel ================= */
 { const css=document.createElement("style"); css.textContent=`
@@ -6084,7 +6084,7 @@ function apply(st, opts={}){
   } else { if(lastView!=="overview" || instant) flyTo("overview", instant); lastView="overview"; setSky("day", instant||reduceMotion); setFx([]); setTrail(0,0); setActiveLabel(""); }
 }
 let lastView="";
-App.selectSite = k => { if(VIEWS[k]){ flyTo(k); lastView=k; } };
+App.selectSite = k => { if(VIEWS[k]){ flyTo(k); lastView=k; if(App.aqHold) App.aqHold(3); } };
 document.getElementById("overviewBtn").addEventListener("click", ()=>{ flyTo("overview"); lastView="overview"; });
 
 
@@ -6186,7 +6186,7 @@ App.enterFPS = key=>{
   FPS.saved={p:camera.position.clone(), t:controls.target.clone()}; fly=null;
   FPS.on=true; App.fpsOn=true; controls.enabled=false; document.body.classList.add("fps-on"); hud.root.hidden=false;
   marker.visible=false; scene.traverse(o=>{ if(o.isLine2){ o.userData.wasVis=o.visible; o.visible=false; } });
-  camera.rotation.order="YXZ"; placeAt(startPose(key)); layout(); applyCam();
+  camera.rotation.order="YXZ"; placeAt(startPose(key)); layout(); applyCam(); if(App.aqHold) App.aqHold(3);
   if(!Q.seen){ Q.seen=true; toast(matchMedia("(pointer:coarse)").matches ? T("hintPad") : T("hintKeys")); }
 };
 function exitFPS(){
@@ -7169,15 +7169,19 @@ function tick(dt){ time+=dt;
   composer.render(); if(!CINE.on){ labelRenderer.render(labelScene,camera); aqFrame(dt); }
 }
 /* ---------- adaptive quality: keep the frame rate smooth, step detail up again when there is headroom ---------- */
-const AQ={ lvl:0, ema:16, t:0, f:0, fixed:/[?&]aa=0/.test(location.search) };
-const AQ_LV=[ {pr:PR_MAX, aa:HQ?4:2, sh:1, rt:HQ?6:4}, {pr:Math.min(PR_MAX,1.5), aa:HQ?4:2, sh:1, rt:4}, {pr:Math.min(PR_MAX,1.25), aa:2, sh:2, rt:3}, {pr:1, aa:0, sh:2, rt:3}, {pr:Math.min(1,PR_MAX)*.85, aa:0, sh:3, rt:2} ];
+const AQ={ lvl:0, t:0, f:0, hold:4, win:[], fixed:/[?&]aa=0/.test(location.search) };
+/* sharpness is kept last: shadows, terrain detail and MSAA step down first, resolution only at the end and never below native 1x */
+const AQ_LV=[ {pr:PR_MAX, aa:HQ?4:2, sh:1, rt:HQ?6:4}, {pr:PR_MAX, aa:2, sh:2, rt:HQ?5:4}, {pr:PR_MAX, aa:2, sh:3, rt:3}, {pr:Math.max(1,Math.min(PR_MAX,1.5)), aa:2, sh:3, rt:3}, {pr:Math.max(1,Math.min(PR_MAX,1.25)), aa:2, sh:4, rt:2} ];
 function aqApply(){ const L=AQ_LV[AQ.lvl]; PR=L.pr; const aa=AQ.fixed?0:L.aa;
   for(const rt of [composer.renderTarget1, composer.renderTarget2]) if(rt.samples!==aa){ rt.samples=aa; rt.dispose(); }
-  fxaa.enabled = aa===0; RT.budget=L.rt; layout(); }
-function aqFrame(dt){
-  if(document.hidden || dt<=0) return; AQ.ema+= (dt*1000-AQ.ema)*.05; AQ.t+=dt;
-  if(AQ.ema>24 && AQ.t>1.5 && AQ.lvl<AQ_LV.length-1){ AQ.lvl++; AQ.t=0; aqApply(); }
-  else if(AQ.ema<12.5 && AQ.t>5 && AQ.lvl>0){ AQ.lvl--; AQ.t=0; aqApply(); } }
+  fxaa.enabled = aa===0; RT.budget=L.rt; layout(); AQ.hold=2; AQ.win.length=0; }
+App.aqHold=(s=3)=>{ AQ.hold=Math.max(AQ.hold,s); AQ.win.length=0; };
+function aqFrame(dt){ // judge by the median of the last ~2 s; hitches from building a place or compiling shaders are ignored
+  if(document.hidden || dt<=0) return; if(AQ.hold>0){ AQ.hold-=dt; return; } const ms=dt*1000; if(ms>90) return;
+  AQ.win.push(ms); AQ.t+=dt; if(AQ.win.length<90) return; if(AQ.win.length>120) AQ.win.shift();
+  const m=[...AQ.win].sort((a,b)=>a-b)[AQ.win.length>>1];
+  if(m>27 && AQ.t>2 && AQ.lvl<AQ_LV.length-1){ AQ.lvl++; AQ.t=0; aqApply(); }
+  else if(m<18 && AQ.t>4 && AQ.lvl>0){ AQ.lvl--; AQ.t=0; aqApply(); } }
 App.aq=AQ;
 renderer.setAnimationLoop(()=>{ if(!CINE.on) tick(Math.min(.05, clock.getDelta())); });
 setTimeout(()=>{ if(AQ.fixed) aqApply(); }, 0);
