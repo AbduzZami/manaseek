@@ -5941,7 +5941,7 @@ App.hpGo=(id,mode)=>{ const H=HPT[HP_LINK[id]&&HPT[HP_LINK[id]]?HP_LINK[id]:id]|
   if(id==="haram"){ if(DRONE.on) droneExit(); if(!FPS.on) App.enterFPS("haram"); return; }
   const air=mode==="drone" || ["hira","thawr","uhud","zubaydah","badr","khaybar","hegra","alula","ahsa","turaif","dhat"].includes(id) && mode!=="walk";
   const d=(HPB[id]&&HPB[id].view)||200;
-  if(air){ if(FPS.on) exitFPS(); if(!DRONE.on) droneEnter(); const D=DRONE; D.pos.set(H.x-d*.45, H.y+d*.42, H.z+d*.6); D.yaw=Math.atan2(-.45,.6); D.pitch=-.4; camera.position.copy(D.pos); }
+  if(air){ if(!DRONE.on) droneEnter(); const D=DRONE; D.pos.set(H.x-d*.45, H.y+d*.42, H.z+d*.6); D.yaw=Math.atan2(-.45,.6); D.pitch=-.4; camera.position.copy(D.pos); }
   else { if(DRONE.on) droneExit(); if(!FPS.on) App.enterFPS("haram"); const R0=Math.min(80,d*.35), free=(x,z)=>!solid(x,z)&&!solid(x+1.2,z)&&!solid(x-1.2,z)&&!solid(x,z+1.2)&&!solid(x,z-1.2); let sx=H.x, sz=H.z+R0;
     if(HPB[id]&&HPB[id].start){ const [a,b]=HPB[id].start; sx=H.x+a; sz=H.z+b; } else
     find: for(const r of [R0,R0*.7,R0*.45,R0*.25,8]) for(let k=0;k<16;k++){ const a=k/16*6.28; const x=H.x+Math.sin(a)*r, z=H.z+Math.cos(a)*r; if(free(x,z)){ sx=x; sz=z; break find; } }
@@ -5991,7 +5991,7 @@ App.hpGo=(id,mode)=>{ const H=HPT[HP_LINK[id]&&HPT[HP_LINK[id]]?HP_LINK[id]:id]|
   P.addEventListener("keydown",e=>{ if(e.key==="Escape") open(false); });
   list.addEventListener("click",e=>{ const t=e.target.closest("[data-id]"); if(!t) return; const id=t.dataset.id; open(false);
     if(t.dataset.m) App.hpGo(id,t.dataset.m);
-    else { if(DRONE.on) droneExit(); if(FPS.on) exitFPS(); const k=HP_LINK[id]&&VIEWS[HP_LINK[id]]?HP_LINK[id]:"hp_"+id; const H=HPT[id]; if(H){ ensureNear(H.x,H.z,2500); const I=islandAt(H.x,H.z); if(I) ensureSite("isl_"+I.id); } App.selectSite(k); } });
+    else App.hpGo(id,"drone"); });
   App.onLang(()=>{ if(!P.hidden) render(); [b1,b2].forEach(b=>{ b.title=b.ariaLabel=App.t("hp.open"); }); }); }
 
 /*HERITAGE-END*/
@@ -6196,7 +6196,7 @@ function exitFPS(){
   if(document.pointerLockElement) document.exitPointerLock?.();
   camera.position.copy(FPS.saved.p); controls.target.copy(FPS.saved.t); layout(); controls.update();
 }
-document.getElementById("fpsExit").addEventListener("click", ()=>{ if(Q.on) App.quest.menu(); else exitFPS(); });
+document.getElementById("fpsExit").addEventListener("click", ()=>App.quest.menu());
 function applyCam(){ if(rideCam()) return; camera.position.copy(FPS.pos); camera.position.y+=Math.sin(FPS.bob)*.035; camera.rotation.set(FPS.pitch, FPS.yaw, 0); }
 
 /* look */
@@ -6212,7 +6212,7 @@ addEventListener("pointermove", e=>{ if(!FPS.on || FPS.picking) return;
 const endLook=e=>touchLook.delete(e.pointerId); addEventListener("pointerup", endLook); addEventListener("pointercancel", endLook);
 /* keys */
 addEventListener("keydown", e=>{ if(!FPS.on) return;
-  if(e.code==="Escape"){ if(!hud.pick.hidden){ closePick(); return; } if(FPS.picking) return; if(Q.on) App.quest.menu(); else exitFPS(); return; }
+  if(e.code==="Escape"){ if(!hud.pick.hidden){ closePick(); return; } if(FPS.picking) return; App.quest.menu(); return; }
   if(FPS.picking) return;
   if(["KeyW","KeyA","KeyS","KeyD","ArrowUp","ArrowDown","ArrowLeft","ArrowRight","ShiftLeft","ShiftRight","Space"].includes(e.code)) e.preventDefault();
   FPS.keys[e.code]=true; if(e.code==="KeyE"||e.code==="KeyF") doAction(); if((e.code==="KeyM"||e.code==="Tab") && Q.on){ e.preventDefault(); App.quest.menu(); } });
@@ -6992,6 +6992,7 @@ const dEl={ hud:document.getElementById("droneHud"), alt:document.getElementById
 const dTouch=matchMedia("(pointer:coarse)").matches;
 function droneGround(x,z){ let g=heightAt(x,z); if(x>MB.x0&&x<MB.x1&&z>MB.z0&&z<MB.z1){ try{ g=Math.max(g, groundAt(x,z)); }catch(e){} } return g; }
 function droneEnter(){ if(DRONE.on) return; let p=camera.position.clone(), yaw, pitch=-.28;
+  DRONE.from=FPS.on?{x:FPS.pos.x, z:FPS.pos.z}:null;
   if(FPS.on){ p=FPS.pos.clone(); yaw=FPS.yaw; if(FPS.ride) endRide(true); exitFPS(); p.y=Math.max(p.y+28, droneGround(p.x,p.z)+70); }
   else { const d=new THREE.Vector3(); camera.getWorldDirection(d); yaw=Math.atan2(-d.x,-d.z); pitch=clamp(Math.asin(clamp(d.y,-1,1)),-1.2,.6); }
   fly=null; DRONE.on=true; App.droneOn=true; DRONE.yaw=yaw; DRONE.pitch=pitch; DRONE.pos.copy(p); DRONE.v.set(0,0,0); DRONE.keys={};
@@ -7000,7 +7001,12 @@ function droneEnter(){ if(DRONE.on) return; let p=camera.position.clone(), yaw, 
 function droneExit(){ if(!DRONE.on) return; DRONE.on=false; App.droneOn=false; document.body.classList.remove("drone-on"); document.getElementById("fps").hidden=true; dEl.hud.hidden=true; dEl.help.hidden=true;
   marker.visible=true; scene.traverse(o=>{ if(o.isLine2 && o.userData.dVis!==undefined){ o.visible=o.userData.dVis; delete o.userData.dVis; } });
   const d=new THREE.Vector3(); camera.getWorldDirection(d); const alt=Math.max(30, camera.position.y-droneGround(camera.position.x,camera.position.z));
-  const t=camera.position.clone().addScaledVector(d, Math.min(4000, alt*2.2)); t.y=droneGround(t.x,t.z); controls.target.copy(t); controls.enabled=true; controls.update(); layout(); }
+  const t=camera.position.clone().addScaledVector(d, Math.min(4000, alt*2.2)); t.y=droneGround(t.x,t.z); controls.target.copy(t); controls.enabled=true; controls.update();
+  /* the app has no map view any more: land and walk on from the spot below the drone (or back where the flight began) */
+  const P=DRONE.pos, free=(x,z)=>!solid(x,z)&&!solid(x+.8,z)&&!solid(x-.8,z)&&!solid(x,z+.8)&&!solid(x,z-.8); let L=null;
+  buildGrid(); for(const r of [0,6,14,28,50]){ for(let k=0;k<(r?12:1);k++){ const a=k/12*6.28, x=P.x+Math.sin(a)*r, z=P.z+Math.cos(a)*r; if(free(x,z)){ L={x,z}; break; } } if(L) break; }
+  if(!L && DRONE.from) L=DRONE.from; if(!L) L={x:P.x, z:P.z};
+  App.enterFPS("haram"); placeAt({x:L.x, z:L.z, yaw:DRONE.yaw}); applyCam(); layout(); }
 function droneUpdate(dt){ const K=DRONE.keys, p=DRONE.pos;
   const f=(K.KeyW||K.ArrowUp?1:0)-(K.KeyS||K.ArrowDown?1:0)-DRONE.joy.y, r=(K.KeyD||K.ArrowRight?1:0)-(K.KeyA||K.ArrowLeft?1:0)+DRONE.joy.x, u=(K.KeyE||K.Space?1:0)-(K.KeyQ||K.KeyC?1:0)+DRONE.lift;
   const g=droneGround(p.x,p.z), alt=Math.max(0,p.y-g), fast=(K.ShiftLeft||K.ShiftRight)?4:1, sp=clamp(8+alt*.75,8,1600)*fast*DRONE.mult;
