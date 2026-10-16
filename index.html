@@ -4445,6 +4445,460 @@ await boot(.74,"map");
   METRO_ST.forEach(st=>{ const y=heightAt(st.x,st.z); const g=new THREE.Group(); g.position.set(st.x,y,st.z); g.rotation.y=st.rot; scene.add(g);
     box(g,10,DECK_Y+4,10,enM,0,(DECK_Y+4)/2,0); box(g,10.2,1.4,10.2,band,0,DECK_Y+1,0); box(g,4,3,.3,M(0x1e2a30),0,1.5,-5.1); addRect(st.x,st.z,5,5,st.rot); });
 }
+/*VKIT-START*/
+/* =========================================================
+   Vehicle kit v2: lofted bodies with separate glass, pillars,
+   lights, trims and proper wheels. Every part carries its own
+   colour, paint mask and roughness/metalness, so one material
+   draws a whole vehicle and instances can be repainted.
+   ========================================================= */
+/* detail level for everything built next: 1 = showroom, lower for traffic and distance copies */
+let VKQ=1; const vkN=(n,min=2)=>Math.max(min,Math.round(n*VKQ));
+const VK_MAT=(()=>{ const m=new THREE.MeshStandardMaterial({vertexColors:true, roughness:.5, metalness:0, envMapIntensity:1.15});
+  m.onBeforeCompile=sh=>{ sh.vertexShader=sh.vertexShader.replace("#include <common>","#include <common>\nattribute float paint;\nattribute vec2 pbr;\nvarying vec2 vPbr;")
+      .replace("#include <begin_vertex>","#include <begin_vertex>\nvPbr=pbr;").replace("vColor.xyz *= instanceColor.xyz;","vColor.xyz *= mix(vec3(1.0), instanceColor.xyz, paint);");
+    sh.fragmentShader=sh.fragmentShader.replace("#include <common>","#include <common>\nvarying vec2 vPbr;")
+      .replace("float roughnessFactor = roughness;","float roughnessFactor = vPbr.x;").replace("float metalnessFactor = metalness;","float metalnessFactor = vPbr.y;"); };
+  m.customProgramCacheKey=()=>"vk2"; return m; })();
+function vkAttr(g,hex,paint,r,m){ g=g.index?g.toNonIndexed():g; const n=g.attributes.position.count, c=new THREE.Color(hex);
+  const col=new Float32Array(n*3), pa=new Float32Array(n).fill(paint), pb=new Float32Array(n*2);
+  for(let i=0;i<n;i++){ col[i*3]=c.r; col[i*3+1]=c.g; col[i*3+2]=c.b; pb[i*2]=r; pb[i*2+1]=m; }
+  g.setAttribute("color",new THREE.BufferAttribute(col,3)); g.setAttribute("paint",new THREE.BufferAttribute(pa,1)); g.setAttribute("pbr",new THREE.BufferAttribute(pb,2));
+  if(g.attributes.uv) g.deleteAttribute("uv"); if(g.attributes.uv1) g.deleteAttribute("uv1"); return g; }
+const VKP={ paint:g=>vkAttr(g,0xffffff,1,.26,.35), glass:g=>vkAttr(g,0x080c10,0,.16,0), trim:g=>vkAttr(g,0x16181a,0,.62,0), satin:g=>vkAttr(g,0x2a2d31,0,.4,.2),
+  chrome:g=>vkAttr(g,0xdfe3e7,0,.1,1), tyre:g=>vkAttr(g,0x111111,0,.88,0), rim:g=>vkAttr(g,0xb9bec4,0,.22,.9), rimD:g=>vkAttr(g,0x34373b,0,.3,.6),
+  head:g=>vkAttr(g,0xf2f6f9,0,.05,.35), tail:g=>vkAttr(g,0x9e0e18,0,.12,.1), amber:g=>vkAttr(g,0xe39316,0,.12,.1), dark:g=>vkAttr(g,0x050607,0,.75,0),
+  plate:g=>vkAttr(g,0xf1f1ec,0,.5,0), int:g=>vkAttr(g,0x2c2925,0,.8,0), col:(hex,r=.35,m=0)=>g=>vkAttr(g,hex,0,r,m) };
+const vkMerge=list=>mergeGeometries(list.filter(Boolean).map(g=>g.index?g.toNonIndexed():g));
+
+/* monotone cubic through keyframes [[z,v],...] */
+function vkMono(K){ if(typeof K==="number") return ()=>K; const n=K.length, xs=K.map(k=>k[0]), ys=K.map(k=>k[1]); if(n===1) return ()=>ys[0];
+  const d=[], m=new Array(n).fill(0); for(let i=0;i<n-1;i++) d.push((ys[i+1]-ys[i])/(xs[i+1]-xs[i]||1e-6));
+  m[0]=d[0]; m[n-1]=d[n-2]; for(let i=1;i<n-1;i++) m[i]=(d[i-1]*d[i]<=0)?0:(d[i-1]+d[i])/2;
+  for(let i=0;i<n-1;i++){ if(d[i]===0){ m[i]=m[i+1]=0; continue; } const a=m[i]/d[i], b=m[i+1]/d[i], h=a*a+b*b; if(h>9){ const t=3/Math.sqrt(h); m[i]=t*a*d[i]; m[i+1]=t*b*d[i]; } }
+  return z=>{ if(z<=xs[0]) return ys[0]; if(z>=xs[n-1]) return ys[n-1]; let i=0; while(z>xs[i+1]) i++; const h=xs[i+1]-xs[i], t=(z-xs[i])/h, t2=t*t, t3=t2*t;
+    return (2*t3-3*t2+1)*ys[i]+(t3-2*t2+t)*h*m[i]+(-2*t3+3*t2)*ys[i+1]+(t3-t2)*h*m[i+1]; }; }
+
+/* a lofted body: sections are rounded superellipses whose half width, bottom, top, squareness and taper vary along z */
+function vkBody(o){ const f={hw:vkMono(o.hw), y0:vkMono(o.y0), y1:vkMono(o.y1), e:vkMono(o.e??4), tb:vkMono(o.tb??1), bw:vkMono(o.bw??1), xo:vkMono(o.xo??0)};
+  const B={o,f,z0:o.z[0],z1:o.z[1]};
+  B.sec=z=>({hw:f.hw(z), y0:f.y0(z), y1:f.y1(z), e:Math.max(2,f.e(z)), tb:f.tb(z), bw:f.bw(z)});
+  B.at=(z,th,out)=>{ const s=B.sec(z), mid=(s.y0+s.y1)/2, hh=(s.y1-s.y0)/2, c=Math.cos(th), sn=Math.sin(th);
+    const y=mid+hh*Math.sign(sn)*Math.pow(Math.abs(sn),2/s.e), k=(y-s.y0)/((s.y1-s.y0)||1);
+    const ku=Math.max(0,k-.5)*2, kd=Math.max(0,.5-k)*2; const wf=1-(1-s.tb)*ku*ku-(1-s.bw)*kd*kd; const x=s.hw*wf*Math.sign(c)*Math.pow(Math.abs(c),2/s.e);
+    if(out){ out[0]=x; out[1]=y; out[2]=z; return out; } return [x,y,z]; };
+  B.thY=(z,y,left)=>{ const s=B.sec(z), mid=(s.y0+s.y1)/2, hh=(s.y1-s.y0)/2||1e-6; const q=Math.max(-1,Math.min(1,(y-mid)/hh)); const t=Math.asin(Math.sign(q)*Math.pow(Math.abs(q),s.e/2)); return left?Math.PI-t:t; };
+  B.normal=(z,th)=>{ const p=B.at(z,th), a=B.at(z,th+.002), b=B.at(Math.min(B.z1,z+.002),th), b2=B.at(Math.max(B.z0,z-.002),th);
+    const t1=[a[0]-p[0],a[1]-p[1],a[2]-p[2]], t2=[b[0]-b2[0],b[1]-b2[1],b[2]-b2[2]]; let n=[t1[1]*t2[2]-t1[2]*t2[1], t1[2]*t2[0]-t1[0]*t2[2], t1[0]*t2[1]-t1[1]*t2[0]];
+    const s=B.sec(z), mid=(s.y0+s.y1)/2; if(n[0]*p[0]+n[1]*(p[1]-mid)<0) n=n.map(v=>-v); const l=Math.hypot(...n)||1; return n.map(v=>v/l); };
+  B.geo=(nz=o.nz||60, nt=o.nt||40, caps=[true,true])=>{ const pos=[], idx=[]; nz=vkN(nz,6); nt=vkN(nt,10)&~1;
+    const zs=[]; for(let i=0;i<=nz;i++){ const t=i/nz; zs.push(B.z0+(B.z1-B.z0)*(.5-.5*Math.cos(Math.PI*t))); }
+    zs.forEach(z=>{ for(let j=0;j<nt;j++) pos.push(...B.at(z,j/nt*Math.PI*2)); });
+    for(let i=0;i<zs.length-1;i++) for(let j=0;j<nt;j++){ const a=i*nt+j, b=i*nt+(j+1)%nt, c=(i+1)*nt+j, d=(i+1)*nt+(j+1)%nt; idx.push(a,b,c, b,d,c); }
+    const g=new THREE.BufferGeometry(); g.setAttribute("position",new THREE.Float32BufferAttribute(pos,3)); g.setIndex(idx); g.computeVertexNormals(); const L=[g.toNonIndexed()];
+    caps.forEach((cp,ci)=>{ if(!cp) return; const z=ci?B.z1:B.z0, pts=[]; for(let j=0;j<nt;j++) pts.push(B.at(z,j/nt*Math.PI*2)); const s=B.sec(z), cy=(s.y0+s.y1)/2, P=[];
+      for(let j=0;j<nt;j++){ const a=pts[j], b=pts[(j+1)%nt]; if(ci) P.push(0,cy,z, a[0],a[1],a[2], b[0],b[1],b[2]); else P.push(0,cy,z, b[0],b[1],b[2], a[0],a[1],a[2]); }
+      const cg=new THREE.BufferGeometry(); cg.setAttribute("position",new THREE.Float32BufferAttribute(P,3)); cg.computeVertexNormals(); L.push(cg); });
+    return vkMerge(L); };
+  /* a patch that follows the surface: z range and theta range (functions of z allowed), lifted off the surface */
+  B.patch=(za,zb,ta,tb,o2={})=>{ const qq=Math.min(1,VKQ*1.6), nz=Math.max(1,Math.round((o2.nz||Math.max(2,Math.ceil(Math.abs(zb-za)/.2)))*qq)), nt=Math.max(1,Math.round((o2.nt||6)*qq)), off=o2.off??.012, pos=[], idx=[], T=v=>typeof v==="function"?v:()=>v, fa=T(ta), fb=T(tb);
+    for(let i=0;i<=nz;i++){ const z=za+(zb-za)*i/nz, a=fa(z), b=fb(z); for(let j=0;j<=nt;j++){ const th=a+(b-a)*j/nt, p=B.at(z,th), n=B.normal(z,th); pos.push(p[0]+n[0]*off,p[1]+n[1]*off,p[2]+n[2]*off); } }
+    for(let i=0;i<nz;i++) for(let j=0;j<nt;j++){ const a=i*(nt+1)+j, b=a+1, c=a+nt+1, d=c+1; idx.push(a,b,c, b,d,c); }
+    const g=new THREE.BufferGeometry(); g.setAttribute("position",new THREE.Float32BufferAttribute(pos,3)); g.setIndex(idx); g.computeVertexNormals();
+    // make sure the patch faces outward
+    const p0=B.at((za+zb)/2,(fa((za+zb)/2)+fb((za+zb)/2))/2), n0=B.normal((za+zb)/2,(fa((za+zb)/2)+fb((za+zb)/2))/2); const nn=g.attributes.normal, k=Math.floor(nn.count/2);
+    if(nn.getX(k)*n0[0]+nn.getY(k)*n0[1]+nn.getZ(k)*n0[2]<0){ g.setIndex(idx.map((v,i)=>i%3===1?idx[i+1]:i%3===2?idx[i-1]:v)); g.computeVertexNormals(); }
+    return g.toNonIndexed(); };
+  /* side patch between two heights, on the right (+x) side or mirrored on both */
+  B.side=(za,zb,ya,yb,o2={})=>{ const R=B.patch(za,zb,z=>B.thY(z,ya),z=>B.thY(z,yb),o2); if(o2.one) return R; const Lp=B.patch(za,zb,z=>B.thY(z,yb,true),z=>B.thY(z,ya,true),o2); return vkMerge([R,Lp]); };
+  return B; }
+
+/* flat shapes */
+function vkRR(w,h,r,seg=4){ const s=new THREE.Shape(), x=-w/2, y=-h/2; r=Math.min(r,w/2-1e-4,h/2-1e-4);
+  s.moveTo(x+r,y); s.lineTo(x+w-r,y); s.quadraticCurveTo(x+w,y,x+w,y+r); s.lineTo(x+w,y+h-r); s.quadraticCurveTo(x+w,y+h,x+w-r,y+h); s.lineTo(x+r,y+h); s.quadraticCurveTo(x,y+h,x,y+h-r); s.lineTo(x,y+r); s.quadraticCurveTo(x,y,x+r,y);
+  return new THREE.ShapeGeometry(s,seg); }
+function vkPoly(pts){ const s=new THREE.Shape(); pts.forEach(([x,y],i)=>i?s.lineTo(x,y):s.moveTo(x,y)); return new THREE.ShapeGeometry(s); }
+const vkBox=(w,h,d,x,y,z,r=0)=>{ const g=r>0?new RoundedBoxGeometry(w,h,d,VKQ<1?1:2,Math.min(r,w/2-.001,h/2-.001,d/2-.001)):new THREE.BoxGeometry(w,h,d); g.translate(x,y,z); return g; };
+const vkCyl=(r1,r2,h,seg,x,y,z,rx=0,rz=0)=>{ const g=new THREE.CylinderGeometry(r1,r2,h,seg); if(rx) g.rotateX(rx); if(rz) g.rotateZ(rz); g.translate(x,y,z); return g; };
+const vkMirX=g=>{ const m=g.clone(); m.scale(-1,1,1); const p=m.index?m.toNonIndexed():m; const a=p.attributes.position; for(let i=0;i<a.count;i+=3){ const x=a.getX(i+1),y=a.getY(i+1),z=a.getZ(i+1); a.setXYZ(i+1,a.getX(i+2),a.getY(i+2),a.getZ(i+2)); a.setXYZ(i+2,x,y,z); } p.computeVertexNormals(); return p; };
+const vkBoth=g=>vkMerge([g, vkMirX(g)]);
+
+/* wheels: rounded tyre, rim face with spokes, hub, disc behind */
+function vkWheel(r, w, o={}){ const sp=o.spokes??5, style=VKQ<.3?"plain":(o.style||"spoke"), L=[];
+  const prof=[]; const rr=r*.62, sh=w*.5, seg=10; prof.push(new THREE.Vector2(rr,-sh*.92)); for(let i=0;i<=seg;i++){ const a=-Math.PI/2+Math.PI*i/seg; prof.push(new THREE.Vector2(r-w*.18+Math.cos(a)*w*.18, Math.sin(a)*sh)); } prof.push(new THREE.Vector2(rr,sh*.92));
+  const ty=new THREE.LatheGeometry(prof.map(v=>new THREE.Vector2(v.x,v.y)),vkN(o.seg||28,8)); ty.rotateZ(Math.PI/2); L.push(VKP.tyre(ty));
+  const face=w*.5-.004, rim=r*.6; L.push(VKP.rimD(vkCyl(rim,rim,w*.8,vkN(24,8),0,0,0,0,Math.PI/2)));
+  if(style==="spoke"){ L.push(VKP.rim(vkCyl(rim,rim*.98,.02,vkN(24,10),face-.02,0,0,0,Math.PI/2))); const ring=new THREE.TorusGeometry(rim*.93,rim*.07,vkN(6,3),vkN(26,10)); ring.rotateY(Math.PI/2); ring.translate(face,0,0); L.push(VKP.rim(ring));
+    for(let i=0;i<sp;i++){ const a=i/sp*Math.PI*2, g=new THREE.BoxGeometry(.03,rim*.86,rim*.2); g.translate(0,rim*.47,0); g.rotateX(a); g.translate(face+.01,0,0); L.push(VKP.rim(g)); }
+    const dk=new THREE.CircleGeometry(rim*.9,vkN(24,10)); dk.rotateY(Math.PI/2); dk.translate(face-.015,0,0); L.push(VKP.dark(dk)); }
+  else if(style==="steel"){ L.push(VKP.rim(vkCyl(rim,rim,.03,vkN(24,8),face-.01,0,0,0,Math.PI/2))); if(VKQ>=.3) for(let i=0;i<8;i++){ const a=i/8*Math.PI*2, h=vkCyl(rim*.09,rim*.09,.04,8,face,Math.cos(a)*rim*.62,Math.sin(a)*rim*.62,0,Math.PI/2); L.push(VKP.dark(h)); } }
+  else { L.push(VKP.rim(vkCyl(rim,rim,.03,vkN(24,8),face-.01,0,0,0,Math.PI/2))); }
+  if(VKQ>=.3) L.push(VKP.chrome(vkCyl(rim*.2,rim*.22,.05,vkN(14,6),face+.012,0,0,0,Math.PI/2)));
+  return vkMerge(L); }
+/* wheels on axles; each wheel placed with its outer face at x = track/2 */
+function vkWheels(axles, r, w, track, o={}){ const L=[], W=vkWheel(r,w,o); for(const z of axles){ const g=W.clone(); g.translate(track/2-w/2,r,z); L.push(g); const m=vkMirX(W); m.translate(-(track/2-w/2),r,z); L.push(m);
+    if(o.dual){ const g2=W.clone(); g2.translate(track/2-w*1.55,r,z); L.push(g2); const m2=vkMirX(W); m2.translate(-(track/2-w*1.55),r,z); L.push(m2); } } return vkMerge(L); }
+/* a dark wheel well on the body side behind a wheel */
+function vkWell(B, z, r, cy, sideX){ const L=[]; for(const s of [1,-1]){ const g=new THREE.CircleGeometry(r,20,0,Math.PI); g.rotateY(s*Math.PI/2); g.translate(s*(sideX(z)+.004),cy,z); L.push(VKP.dark(g)); } return vkMerge(L); }
+
+/* =========================================================
+   Vehicle designs built from the kit. Nose at +z, ground y=0.
+   ========================================================= */
+/* ---------- cars ---------- */
+function vkCar(P){ const L=P.L, W=P.W, z0=-L/2, z1=L/2, gc=P.gc??.3, belt=P.belt, hood=P.hood, deck=P.deck??belt-.02, kind=P.kind||"sedan";
+  const [zr,zf]=P.axles, wr=P.wr, ww=P.ww??.24, hw=W/2, track=W-.02;
+  const A=P.cab.a, WS=P.cab.ws, RB=P.cab.rb, C=P.cab.c, roof=P.roof, parts=[];
+  /* lower body */
+  const yTop=[]; yTop.push([z0, deck-(P.tailDrop??.1)],[z0+.18, deck]);
+  if(kind==="pickup"){ yTop.push([P.bed[1]-.05, belt],[A, belt+.01]); }
+  else if(kind==="sedan"){ yTop.push([C-.25, deck+.02],[C, belt],[A, belt+.02]); }
+  else { yTop.push([C, belt],[A, belt+.01]); }
+  yTop.push([A+.35, (belt+hood)/2+.02],[z1-.35, hood],[z1-.08, hood-.05],[z1, hood-(P.noseDrop??.08)]);
+  const Bd=vkBody({z:[z0,z1], nz:70, nt:44, e:P.e??4.8, tb:P.tbBody??.87, bw:.95,
+    hw:[[z0,hw*(P.rearPinch??.9)],[z0+.22,hw*.985],[z0+.55,hw],[z1-.6,hw],[z1-.22,hw*.975],[z1,hw*(P.nosePinch??.93)]],
+    y0:[[z0,gc+.14],[z0+.35,gc+.02],[z0+.7,gc],[z1-.7,gc],[z1-.3,gc+.03],[z1,gc+(P.chin??.1)]], y1:yTop});
+  parts.push(VKP.paint(Bd.geo()));
+  /* greenhouse in glass, then the roof and pillars in paint over it */
+  const gy0=belt-.07, ghw=hw*(P.ghw??.86), tbG=P.tbG??.74;
+  const top=[[C, belt+.0],[RB-.02, roof-.035],[RB+.25, roof],[WS-.2, roof],[WS, roof-.03],[A, belt+.0]];
+  if(P.cab.rearMid) top.splice(1,0,[P.cab.rearMid[0],P.cab.rearMid[1]]);
+  if(P.cab.wsMid) top.splice(top.length-1,0,[P.cab.wsMid[0],P.cab.wsMid[1]]);
+  const G=vkBody({z:[C,A], nz:56, nt:40, e:P.eG??2.8, tb:tbG, bw:1, hw:[[C,ghw*.96],[C+.3,ghw],[A-.3,ghw*.99],[A,ghw*.95]], y0:gy0, y1:top});
+  parts.push(VKP.glass(G.geo()));
+  const thc=P.thc??.62; // where the roof meets the side glass (theta)
+  if(VKQ<.2){ parts.push(VKP.paint(G.patch(RB, WS, thc, Math.PI-thc, {nz:3, nt:3, off:.02}))); for(const az of [zr,zf]) for(const s of [1,-1]) parts.push(VKP.tyre(vkCyl(wr,wr,ww,8,s*(track/2-ww/2),wr,az,0,Math.PI/2))); return vkMerge(parts); }
+  parts.push(VKP.paint(G.patch(RB, WS, thc, Math.PI-thc, {nt:14, off:.008})));                         // roof
+  parts.push(VKP.paint(G.patch(WS-.04, A, thc-.17, thc+.06, {nz:24, nt:4, off:.008})));                // A pillars
+  parts.push(VKP.paint(G.patch(WS-.04, A, Math.PI-thc-.06, Math.PI-thc+.17, {nz:24, nt:4, off:.008})));
+  parts.push(VKP.paint(G.patch(C, RB+.04, thc-.2, thc+.06, {nz:20, nt:4, off:.008})));                 // C pillars along the rear glass
+  parts.push(VKP.paint(G.patch(C, RB+.04, Math.PI-thc-.06, Math.PI-thc+.2, {nz:20, nt:4, off:.008})));
+  const yb=belt-.02, yt=z=>G.f.y0(z)+(G.f.y1(z)-G.f.y0(z))*.97;
+  const sideBand=(za,zb)=>vkMerge([G.patch(za,zb,z=>G.thY(z,yb),thc+.02,{nz:3,nt:6,off:.009}), G.patch(za,zb,Math.PI-thc-.02,z=>G.thY(z,yb,true),{nz:3,nt:6,off:.009})]);
+  for(const [za,zb] of (P.pillars||[])) parts.push(VKP.paint(sideBand(za,zb)));                         // B, C and D pillars, sail panels
+  /* window surround and belt trim */
+  parts.push((P.chromeBelt?VKP.chrome:VKP.trim)(Bd.side(C+.05, A-.05, belt-.035, belt-.005, {nt:2, off:.006})));
+  /* wheel wells and wheels */
+  for(const az of [zr,zf]){ const R=wr*1.13; parts.push(VKP.dark(vkArch(Bd, az, wr, R))); if(P.cladding) parts.push(VKP.trim(vkArch(Bd, az, wr, R+.07, R, .008))); }
+  parts.push(vkWheels([zr,zf], wr, ww, track, {style:P.wheel||"spoke", spokes:P.spokes||5}));
+  /* side details: rocker, door gaps, handles, mirrors */
+  parts.push(VKP.trim(Bd.side(z0+.6, z1-.6, gc+.02, gc+.09, {nt:2, off:.005})));
+  for(const z of (P.doors||[])) parts.push(VKP.dark(Bd.side(z-.006, z+.006, gc+.12, belt-.04, {nz:1, nt:6, off:.005})));
+  for(const z of (P.handles||[])){ const y=belt-.1; for(const s of [1,-1]){ const p=Bd.at(z, Bd.thY(z,y,s<0)); parts.push(VKP.chrome(vkBox(.02,.035,.2, p[0]+s*.012, y, z, .01))); } }
+  { const z=A-.18, y=belt+.06, p=Bd.at(z, Bd.thY(z,belt-.05)); for(const s of [1,-1]){ parts.push(VKP.paint(vkBox(.2,.12,.1, s*(Math.abs(p[0])+.1), y, z, .03))); parts.push(VKP.trim(vkBox(.06,.04,.06, s*(Math.abs(p[0])+.02), y-.03, z+.01, .01))); } }
+  /* front: headlights wrapping the corners, grille, lower intake, plate */
+  const fs=Bd.sec(z1), fy0=fs.y0, fy1=fs.y1, fw=fs.hw;
+  const hl0=P.hl?.[0]??(fy1-.17), hl1=P.hl?.[1]??(fy1-.05);
+  const lens=VKP.col(0xb9c8d4,.05,.5), led=VKP.col(0xffffff,.2,0);
+  parts.push(VKP.satin(Bd.side(z1-(P.hlWrap??.34)-.02, z1, hl0-.015, hl1+.015, {nt:5, off:.007})));
+  parts.push(lens(Bd.side(z1-(P.hlWrap??.34), z1, hl0, hl1, {nt:5, off:.009})));
+  parts.push(led(Bd.side(z1-(P.hlWrap??.34)+.02, z1, hl0+.01, hl0+.035, {nt:2, off:.011})));
+  parts.push(VKP.satin(capRR(z1, fw*.72, (hl0+hl1)/2, fw*.44, hl1-hl0+.03, .03, 1, .003)));
+  parts.push(lens(capRR(z1, fw*.72, (hl0+hl1)/2, fw*.4, hl1-hl0, .03, 1, .005)));
+  for(const sx of [1,-1]) for(const k of [.6,.84]) parts.push(VKP.chrome(capRR(z1, sx*fw*k, (hl0+hl1)/2+.005, .07, .07, .035, 0, .007)));
+  parts.push(led(capRR(z1, fw*.72, hl0+.022, fw*.4, .022, .01, 1, .008)));
+  const gH=P.grille?.[1]??.16, gW=P.grille?.[0]??fw*.95; parts.push(VKP.trim(capRR(z1, 0, P.grille?.[2]??(hl0-gH*.1), gW, gH, .05, 0)));
+  if(P.grilleChrome) parts.push(VKP.chrome(capRR(z1, 0, P.grille?.[2]??(hl0-gH*.1), gW+.04, gH+.04, .06, 0, .002)));
+  parts.push(VKP.trim(capRR(z1, 0, fy0+.12, fw*1.2, .12, .04, 0))); parts.push(VKP.plate(capRR(z1, 0, fy0+.2, .52, .11, .01, 0, .006)));
+  for(const s of [1,-1]) parts.push(VKP.amber(capRR(z1, s*fw*.78, fy0+.13, .12, .05, .02, 0, .006)));
+  /* rear: tail lights, plate, bumper */
+  const rs=Bd.sec(z0), ry1=rs.y1, ry0=rs.y0, rw=rs.hw;
+  parts.push(VKP.tail(Bd.side(z0, z0+(P.tlWrap??.26), ry1-.2, ry1-.04, {nt:5, off:.008})));
+  parts.push(VKP.tail(capRR(z0, rw*.72, ry1-.12, rw*.44, .15, .03, 1, .004, true))); parts.push(VKP.col(0xd8d8d8,.1,.6)(capRR(z0, rw*.62, ry1-.15, rw*.12, .05, .02, 1, .006, true)));
+  if(P.tlBar) parts.push(VKP.tail(capRR(z0, 0, ry1-.1, rw*1.1, .04, .02, 0, .004, true)));
+  parts.push(VKP.plate(capRR(z0, 0, ry1-.33, .52, .11, .01, 0, .006, true))); parts.push(VKP.trim(capRR(z0, 0, ry0+.1, rw*1.5, .12, .04, 0, .004, true)));
+  if(P.spare) parts.push(VKP.tyre(vkCyl(.36,.36,.24,24,0,ry1-.45,z0-.12,Math.PI/2)));
+  if(P.rails){ for(const s of [1,-1]) parts.push(VKP.satin(vkBox(.05,.05,(WS-RB)*.9, s*ghw*tbG*.82, roof+.03, (WS+RB)/2, .02))); }
+  if(P.taxi){ parts.push(VKP.col(0xf6d43a,.3)(vkBox(.55,.16,.22,0,roof+.1,(WS+RB)/2,.04))); }
+  /* pickup bed */
+  if(kind==="pickup"){ const [b0,b1]=P.bed, bh=belt-.02, fl=gc+.45; parts.push(VKP.dark(vkBox(hw*1.8, .02, b1-b0-.08, 0, fl, (b0+b1)/2)));
+    for(const s of [1,-1]) parts.push(VKP.paint(vkBox(.05, bh-fl, b1-b0-.05, s*(hw*.9), (bh+fl)/2, (b0+b1)/2, .02)));
+    parts.push(VKP.paint(vkBox(hw*1.8, bh-fl, .06, 0, (bh+fl)/2, b1-.02, .02))); }
+  return vkMerge(parts);
+  function capRR(z, x, y, w, h, r, sym, off=.004, rear){ const L2=[]; const xs=sym?[x,-x]:[x]; for(const xx of xs){ const g=vkRR(w,h,r); if(rear) g.rotateY(Math.PI); g.translate(xx,y,z+(rear?-off:off)); L2.push(g); } return vkMerge(L2); } }
+/* a dark arch on the body side: from the rocker up to a semicircle over the wheel */
+function vkArch(B, az, cy, R, R0=0, off=.005){ const L=[], N=vkN(22,6), pos=[];
+  for(const s of [1,-1]){ for(let i=0;i<N;i++){ const a0=Math.PI*i/N, a1=Math.PI*(i+1)/N; const pts=[];
+      for(const [a,r] of [[a0,R0],[a1,R0],[a1,R],[a0,R]]){ const z=az+Math.cos(a)*r, y=cy+Math.sin(a)*r; const th=B.thY(z,y,s<0), p=B.at(z,th), n=B.normal(z,th); pts.push([p[0]+n[0]*off,p[1]+n[1]*off,p[2]+n[2]*off]); }
+      const [p0,p1,p2,p3]=pts; if(s>0) pos.push(...p0,...p2,...p1, ...p0,...p3,...p2); else pos.push(...p0,...p1,...p2, ...p0,...p2,...p3); } }
+  const g=new THREE.BufferGeometry(); g.setAttribute("position",new THREE.Float32BufferAttribute(pos,3)); g.computeVertexNormals(); return g; }
+
+const VK_CARS=[
+ {name:"Mid-size sedan", note:"the everyday family car", paint:0xd9dcdf, P:{L:4.88,W:1.84,gc:.16,belt:.95,hood:.86,roof:1.44,axles:[-1.42,1.43],wr:.335,
+   cab:{c:-1.38,rb:-.72,ws:.42,a:1.15,rearMid:[-1.1,1.24],wsMid:[.82,1.25]}, pillars:[[-1.38,-1.18],[-.05,.05]], doors:[-1.02,.0,1.06], handles:[-.62,.42], chromeBelt:true, wheel:"spoke", spokes:5}},
+ {name:"Compact sedan", note:"small, light, common as a taxi", paint:0xeeeeec, P:{L:4.4,W:1.73,gc:.17,belt:.94,hood:.84,roof:1.45,axles:[-1.27,1.28],wr:.31,
+   cab:{c:-1.22,rb:-.62,ws:.38,a:1.02,rearMid:[-.98,1.24],wsMid:[.72,1.25]}, pillars:[[-1.22,-1.05],[-.05,.04]], doors:[-.92,-.02,.98], handles:[-.55,.38], wheel:"steel"}},
+ {name:"Executive sedan", note:"long, low and sleek", paint:0x6b7077, P:{L:5.1,W:1.9,gc:.15,belt:.93,hood:.83,roof:1.45,axles:[-1.5,1.55],wr:.35,
+   cab:{c:-1.55,rb:-.8,ws:.4,a:1.12,rearMid:[-1.26,1.26],wsMid:[.8,1.26]}, pillars:[[-1.55,-1.3],[-.08,.04]], doors:[-1.12,-.02,1.05], handles:[-.7,.4], chromeBelt:true, grilleChrome:true, wheel:"spoke", spokes:10}},
+ {name:"Full-size SUV", note:"tall, square, the desert workhorse", paint:0xf1f1ef, P:{kind:"suv",L:4.95,W:1.98,gc:.26,belt:1.18,hood:1.07,roof:1.9,axles:[-1.43,1.42],wr:.4,ww:.27,tailDrop:.04,noseDrop:.1,
+   cab:{c:-2.33,rb:-2.2,ws:.4,a:.96,wsMid:[.75,1.7]}, pillars:[[-2.33,-1.95],[-1.0,-.9],[.05,.15]], doors:[-1.02,.1,1.04], handles:[-.62,.52], rails:true, cladding:true, wheel:"spoke", spokes:6, tlWrap:.1, grille:[1.2,.28], grilleChrome:true, ghw:.88, tbG:.82, eG:3.2, e:4.2}},
+ {name:"Extended SUV", note:"long wheelbase, three rows", paint:0x1e3550, P:{kind:"suv",L:5.35,W:2.05,gc:.24,belt:1.2,hood:1.12,roof:1.92,axles:[-1.65,1.6],wr:.41,ww:.28,tailDrop:.03,noseDrop:.08,
+   cab:{c:-2.55,rb:-2.42,ws:.48,a:1.05,wsMid:[.84,1.72]}, pillars:[[-2.55,-2.2],[-1.25,-1.13],[.1,.2]], doors:[-1.2,.15,1.12], handles:[-.75,.6], rails:true, wheel:"spoke", spokes:6, tlWrap:.1, grille:[1.36,.32], grilleChrome:true, ghw:.9, tbG:.84, eG:3.6, e:4.6, chromeBelt:true}},
+ {name:"Compact crossover", note:"rounded, raised hatch", paint:0x8e2a2a, P:{kind:"suv",L:4.6,W:1.86,gc:.22,belt:1.05,hood:.96,roof:1.7,axles:[-1.32,1.36],wr:.37,tailDrop:.08,
+   cab:{c:-2.15,rb:-1.75,ws:.3,a:1.0,rearMid:[-2.0,1.5],wsMid:[.68,1.55]}, pillars:[[-2.15,-1.8],[-.98,-.88],[-.02,.08]], doors:[-.95,-.0,1.0], handles:[-.58,.42], cladding:true, rails:true, wheel:"spoke", spokes:5, tlWrap:.22}},
+ {name:"Double-cab pickup", note:"four doors and an open bed", paint:0xe9e7e1, P:{kind:"pickup",L:5.3,W:1.86,gc:.28,belt:1.15,hood:1.06,roof:1.8,axles:[-1.6,1.48],wr:.38,ww:.26,tailDrop:.02,noseDrop:.1,
+   bed:[-2.65,-.85], cab:{c:-.9,rb:-.78,ws:.45,a:1.0,wsMid:[.8,1.62]}, pillars:[[-.9,-.8],[-.05,.05]], doors:[-.88,.0,1.05], handles:[-.52,.5], wheel:"spoke", spokes:6, tlWrap:.06, grille:[1.2,.28], grilleChrome:true, cladding:true, ghw:.88, tbG:.84, eG:3.4, e:4.2}},
+ {name:"High-roof van", note:"the 12-seat pilgrim shuttle", paint:0xf4f4f2, P:{kind:"suv",L:5.38,W:1.88,gc:.2,belt:1.12,hood:1.04,roof:2.28,axles:[-1.65,1.65],wr:.34,tailDrop:.02,noseDrop:.12,
+   cab:{c:-2.66,rb:-2.58,ws:1.68,a:2.25,wsMid:[2.0,1.9]}, pillars:[[-2.66,-2.45],[-1.45,-1.35],[.2,.3],[1.45,1.6]], doors:[-1.42,.25,1.45], handles:[1.0,.5], wheel:"steel", tlWrap:.05, ghw:.92, tbG:.9, eG:5, e:5, grille:[1.1,.2]}},
+ {name:"Hatchback", note:"short, upright tail", paint:0x2f5e8f, P:{kind:"suv",L:4.1,W:1.76,gc:.17,belt:.97,hood:.86,roof:1.5,axles:[-1.2,1.25],wr:.31,tailDrop:.08,
+   cab:{c:-1.92,rb:-1.6,ws:.38,a:1.0,rearMid:[-1.82,1.35],wsMid:[.7,1.32]}, pillars:[[-1.92,-1.6],[-.05,.05]], doors:[-.9,-.0,.98], handles:[-.55,.38], wheel:"spoke", spokes:5, tlWrap:.2}},
+ {name:"City taxi", note:"sedan with a roof sign", paint:0xf2f2f0, P:{L:4.75,W:1.82,gc:.17,belt:.95,hood:.86,roof:1.45,axles:[-1.38,1.4],wr:.32,
+   cab:{c:-1.32,rb:-.7,ws:.4,a:1.12,rearMid:[-1.06,1.24],wsMid:[.8,1.25]}, pillars:[[-1.32,-1.13],[-.05,.05]], doors:[-1.0,.0,1.04], handles:[-.6,.42], taxi:true, wheel:"steel"}}
+];
+var VK_SHOW={ car:()=>VK_CARS.map(c=>({name:c.name, note:c.note, paint:c.paint, geo:vkCar(c.P)})) };
+VK_SHOW.dbg=()=>{ const c=VK_CARS[0]; return [[0,1,.15],[1,.05,0],[0,.15,1],[-.6,.3,-1],[1,.6,1],[0,-.2,1]].map((v,i)=>({name:"view "+i, paint:c.paint, geo:vkCar(c.P), view:v})); };
+
+/* ---------- buses and coaches. Passenger doors on the right (-x when the nose points to +z) ---------- */
+function vkBus(P){ const L=P.L, W=P.W??2.55, hw=W/2, H=P.H, gc=P.gc??.32, z0=-L/2, z1=L/2, parts=[], wr=P.wr??.52;
+  const fr=P.frontRound??.06;
+  const Bd=vkBody({z:[z0,z1], nz:80, nt:56, e:P.e??10, tb:P.tb??.95, bw:.99,
+    hw:[[z0,hw*.965],[z0+.25,hw],[z1-.45,hw],[z1-.12,hw*(1-fr*.4)],[z1,hw*(1-fr)]],
+    y0:[[z0,gc+.06],[z0+.45,gc],[z1-.45,gc],[z1,gc+.04]],
+    y1:[[z0,H-.14],[z0+.35,H],[z1-(P.roofDrop??.6),H],[z1-.12,H-(P.noseTop??.1)],[z1,H-(P.noseTop??.1)-.12]]});
+  parts.push(VKP.paint(Bd.geo()));
+  const one=(za,zb,ya,yb,neg,o2={})=>Bd.patch(za,zb,z=>Bd.thY(z,neg?yb:ya,neg),z=>Bd.thY(z,neg?ya:yb,neg),{nt:2,nz:2,off:.025,...o2});
+  const both=(za,zb,ya,yb,o2)=>vkMerge([one(za,zb,ya,yb,false,o2),one(za,zb,ya,yb,true,o2)]);
+  if(VKQ<.2){ const [a2,b2]=P.win; parts.push(VKP.glass(both(z0+.6,z1-.6,a2,b2,{nz:1,nt:1}))); const g=vkRR(W*.86,H-1.5,.1); g.translate(0,(H+1.1)/2,z1+.02); parts.push(VKP.glass(g)); for(const az of P.axles) for(const s of [1,-1]) parts.push(VKP.tyre(vkCyl(wr,wr,.3,8,s*(W/2-.17),wr,az,0,Math.PI/2))); return vkMerge(parts); }
+  const [wl,wh]=P.win, door=P.doorF??[z1-1.55,z1-.6], mdoor=P.doorM;
+  /* glazing: left side runs to the driver's window, right side stops at the entrance door */
+  const bands=[[wl,wh]].concat(P.win2?[P.win2]:[]);
+  for(const [a,b] of bands){ parts.push(VKP.glass(one(z0+.55, z1-.55, a, b, false)));
+    const segs=[[z0+.55, door[0]-.12],[door[1]+.12, z1-.55]]; if(mdoor){ segs.splice(0,1,[z0+.55, mdoor[0]-.1],[mdoor[1]+.1, door[0]-.12]); }
+    for(const [za,zb] of segs) if(zb>za) parts.push(VKP.glass(one(za, zb, a, b, true))); }
+  if(P.mullion){ for(let z=z0+.55+P.mullion; z<z1-.8; z+=P.mullion) for(const [a,b] of bands) parts.push((P.mullionPaint?VKP.paint:VKP.trim)(both(z-.05, z+.05, a-.01, b+.01, {off:.016}))); }
+  if(P.chrome) parts.push(VKP.chrome(both(z0+.4, z1-.4, wl-.08, wl-.05, {off:.014})));
+  /* doors on the right side */
+  for(const d of [door].concat(mdoor?[mdoor]:[])){ parts.push(VKP.glass(one(d[0], d[1], gc+.2, wh, true, {off:.014}))); parts.push(VKP.trim(one((d[0]+d[1])/2-.02,(d[0]+d[1])/2+.02, gc+.2, wh, true, {off:.017}))); }
+  /* luggage bays and skirt */
+  if(P.bays) for(let i=0;i<P.bays;i++){ const zc=z0+2.2+i*(L-5.5)/Math.max(1,P.bays-1); parts.push(VKP.dark(both(zc-.008, zc+.008, gc+.15, wl-.25, {off:.013}))); }
+  parts.push(VKP.trim(both(z0+.3, z1-.3, gc, gc+.1, {off:.01})));
+  /* livery */
+  for(const lv of (P.livery||[])) parts.push(VKP.col(lv.c,.3,lv.m??.2)(lv.one!==undefined?one(lv.z0??z0+.2, lv.z1??z1-.2, lv.y0, lv.y1, lv.one, {off:.013, nz:lv.nz||6}):both(lv.z0??z0+.2, lv.z1??z1-.2, lv.y0, lv.y1, {off:.013, nz:6})));
+  /* wheels and arches */
+  const axles=P.axles; for(const az of axles){ const R=wr*1.12; parts.push(VKP.dark(vkArch(Bd, az, wr, R))); }
+  parts.push(vkWheels(axles.slice(0,1), wr, .3, W-.05, {style:"steel"})); parts.push(vkWheels(axles.slice(1), wr, .3, W-.05, {style:"steel", dual:P.dual!==false}));
+  /* front: windscreen, destination sign, lights, grille */
+  const fs=Bd.sec(z1), fw=fs.hw, fy0=fs.y0, fy1=fs.y1, cap=(x,y,w,h,r,off=.006,rear)=>{ const g=vkRR(w,h,r); if(rear) g.rotateY(Math.PI); g.translate(x,y,(rear?z0-off:z1+off)); return g; };
+  const ws0=P.ws?.[0]??1.15, ws1=fy1-(P.ws?.[1]??.22);
+  parts.push(VKP.glass(cap(0,(ws0+ws1)/2,fw*1.86,ws1-ws0,.12))); if(P.split!==false) parts.push(VKP.trim(cap(0,(ws0+ws1)/2,.05,ws1-ws0,.01,.009)));
+  if(P.win2){ parts.push(VKP.glass(cap(0,(P.win2[0]+P.win2[1])/2+.05,fw*1.8,P.win2[1]-P.win2[0]+.1,.12))); }
+  parts.push(VKP.dark(cap(0,ws1-.17,fw*1.4,.26,.04,.01))); parts.push(VKP.amber(cap(0,ws1-.17,fw*1.0,.12,.02,.012)));
+  const hy=P.hlY??.62; for(const s of [1,-1]){ parts.push(VKP.satin(cap(s*fw*.72,hy,.52,.2,.06,.006))); parts.push(VKP.col(0xc4d2dc,.05,.5)(cap(s*fw*.72,hy,.46,.15,.05,.009))); parts.push(VKP.col(0xffffff,.2,0)(cap(s*fw*.72,hy-.045,.44,.03,.01,.011))); }
+  parts.push(VKP.trim(cap(0,hy,fw*.9,.24,.05,.006))); parts.push(VKP.trim(cap(0,fy0+.12,fw*1.9,.2,.06,.005))); parts.push(VKP.plate(cap(0,hy-.22,.52,.11,.01,.008)));
+  /* rabbit-ear mirrors */
+  if(P.ears!==false) for(const s of [1,-1]){ const arm=new THREE.TorusGeometry(.32,.03,6,10,Math.PI*.6); arm.rotateY(-s*Math.PI/2); arm.translate(s*(fw-.05),H-.75,z1+.05); parts.push(VKP.trim(arm)); parts.push(VKP.trim(vkBox(.08,.38,.22,s*(fw+.05),H-.95,z1+.33,.03))); }
+  /* rear: window, engine grille, lights */
+  const rs=Bd.sec(z0); if(P.rearWin!==false) parts.push(VKP.glass(cap(0,(wl+wh)/2+.1,rs.hw*1.7,wh-wl,.1,.006,true)));
+  parts.push(VKP.dark(cap(0,gc+.75,rs.hw*1.5,.5,.05,.006,true))); for(const s of [1,-1]){ parts.push(VKP.tail(cap(s*rs.hw*.88,gc+1.1,.16,.9,.05,.008,true))); parts.push(VKP.amber(cap(s*rs.hw*.88,gc+.55,.16,.14,.03,.008,true))); }
+  parts.push(VKP.plate(cap(0,gc+.35,.52,.11,.01,.008,true))); parts.push(VKP.trim(cap(0,gc+.12,rs.hw*1.9,.2,.06,.005,true)));
+  /* roof: air-conditioning pod */
+  if(P.ac!==false) parts.push(VKP.paint(vkBox(1.8,.22,P.acL??3.2,0,H+.09,P.acZ??-.5,.1)));
+  if(P.taper) {}
+  return vkMerge(parts); }
+
+const VK_BUSES=[
+ {name:"High-deck coach", note:"white, full dark glazing", paint:0xf3f3f1, P:{L:12.2,H:3.65,axles:[-3.8,-2.45,3.25],win:[1.95,3.25],bays:4,dual:false}},
+ {name:"Double-deck coach", note:"two passenger levels", paint:0xf3f3f1, P:{L:13.4,H:4.0,axles:[-4.6,-3.25,3.75],win:[1.55,2.25],win2:[2.65,3.62],doorF:[13.4/2-1.6,13.4/2-.65],doorM:[-.3,.6],dual:false,bays:0,ws:[1.05,.3],ac:false,
+   livery:[{y0:2.3,y1:2.6,c:0x2a6a4a}]}},
+ {name:"Coach with green sweep", note:"two-tone livery, gold line", paint:0xf3f3f1, P:{L:12.2,H:3.65,axles:[-3.8,-2.45,3.25],win:[1.95,3.25],bays:4,dual:false,
+   livery:[{y0:.42,y1:1.15,c:0x1e6b4a},{y0:1.17,y1:1.25,c:0xc8a24a,m:.6}]}},
+ {name:"Classic coach", note:"framed windows, chrome line", paint:0xece6d8, P:{L:12.0,H:3.45,axles:[-3.6,3.0],win:[1.85,3.0],mullion:1.32,mullionPaint:true,chrome:true,bays:3,frontRound:.03,split:true,
+   livery:[{y0:1.25,y1:1.45,c:0x8a3a1f}]}},
+ {name:"Super high-deck coach", note:"tallest, raised floor", paint:0xffffff, P:{L:13.7,H:3.95,axles:[-4.4,-3.0,3.6],win:[2.2,3.55],bays:5,dual:false,ws:[1.1,.3],
+   livery:[{y0:.42,y1:.9,c:0x2b2f36}]}},
+ {name:"Midi coach", note:"9 m, two axles", paint:0xf3f3f1, P:{L:9.0,H:3.3,axles:[-2.3,2.55],win:[1.75,2.95],bays:2,acL:2.2,acZ:-.3}},
+ {name:"Minibus", note:"25 seats, rounded nose", paint:0xf6f6f4, P:{L:7.0,W:2.08,H:2.65,gc:.26,wr:.4,axles:[-1.8,2.0],win:[1.45,2.3],bays:0,frontRound:.14,noseTop:.25,roofDrop:1.1,ears:false,ws:[1.05,.18],acL:1.6,dual:true,
+   doorF:[7/2-1.35,7/2-.55],livery:[{y0:.35,y1:.55,c:0x3b6fb0}]}},
+ {name:"City bus, low floor", note:"wide doors, big windows", paint:0xd8dde2, P:{L:12.0,H:3.15,gc:.26,wr:.5,axles:[-2.8,3.0],win:[1.05,2.75],doorF:[12/2-1.5,12/2-.35],doorM:[-.6,.6],bays:0,ws:[.55,.12],hlY:.5,ears:false,dual:true,
+   livery:[{y0:.35,y1:.9,c:0x2d6e9c}]}},
+ {name:"Airport apron bus", note:"very wide, low, many doors", paint:0xf2f2f0, P:{L:13.5,W:3.0,H:2.95,gc:.22,wr:.45,axles:[-3.4,3.7],win:[.95,2.65],doorF:[13.5/2-2.2,13.5/2-.9],doorM:[-.75,.75],bays:0,ws:[.6,.15],hlY:.45,frontRound:.04,ears:false,dual:false,
+   livery:[{y0:.3,y1:.75,c:0x7a8088}]}},
+ {name:"Shuttle bus", note:"boxy, two doors, roof racks", paint:0xf0eee8, P:{L:10.5,H:3.2,axles:[-2.8,3.0],win:[1.6,2.85],mullion:1.4,doorF:[10.5/2-1.5,10.5/2-.6],doorM:[-.4,.5],bays:0,frontRound:.02,e:14,ears:false,
+   livery:[{y0:1.3,y1:1.42,c:0xc29a3e,m:.5},{y0:.4,y1:1.0,c:0x5a4636}]}}
+];
+VK_SHOW.bus=()=>VK_BUSES.map(c=>({name:c.name, note:c.note, paint:c.paint, geo:vkBus(c.P), view:[1.0,.32,1.05]}));
+
+/* ---------- rail: high-speed power cars, coaches, metro cars. Rail top at y=0 ---------- */
+function vkRail(P){ const L=P.L, W=P.W??2.95, hw=W/2, H=P.H??3.9, y0b=P.floor??1.0, z0=-L/2, z1=L/2, parts=[], Ln=P.nose??0;
+  const hwK=[[z0,hw*(P.cab0?.6:.96)],[z0+.25,hw],[z1-Math.max(Ln,.3),hw]], y1K=[[z0,H-(P.cab0?.6:.08)],[z0+.3,H],[z1-Math.max(Ln,.3)-(P.roofRun??0),H]], y0K=[[z0,y0b+.05],[z0+.4,y0b],[z1-Math.max(Ln,.4),y0b]];
+  if(Ln>0){ const k=P.nk||{}; hwK.push([z1-Ln*.55,hw*(k.w1??.86)],[z1-Ln*.15,hw*(k.w2??.55)],[z1,hw*(k.w3??.2)]); y1K.push([z1-Ln*.6,H-(H-y0b)*(k.t1??.22)],[z1-Ln*.2,y0b+(H-y0b)*(k.t2??.35)],[z1,y0b+(H-y0b)*(k.t3??.14)]); y0K.push([z1-Ln*.3,y0b+(k.b1??.02)],[z1,y0b+(k.b2??.12)]); }
+  else { hwK.push([z1-.12,hw*.97],[z1,hw*(P.noCab?.96:(P.flatPinch??.9))]); y1K.push([z1-.15,H-.08],[z1,H-(P.noCab?.08:(P.flatTop??.35))]); y0K.push([z1,y0b+.05]); }
+  const Bd=vkBody({z:[z0,z1], nz:Ln>0?110:70, nt:56, e:P.e??6, tb:P.tb??.86, bw:P.bw??.9, hw:hwK, y1:y1K, y0:y0K});
+  parts.push(VKP.paint(Bd.geo()));
+  const one=(za,zb,ya,yb,neg,o2={})=>Bd.patch(za,zb,z=>Bd.thY(z,neg?yb:ya,neg),z=>Bd.thY(z,neg?ya:yb,neg),{nt:3,nz:2,off:.02,...o2});
+  const both=(za,zb,ya,yb,o2)=>vkMerge([one(za,zb,ya,yb,false,o2),one(za,zb,ya,yb,true,o2)]);
+  const bodyEnd=z1-(Ln>0?Ln*.75:.6), bodyStart=z0+.8;
+  /* livery bands first, glass over them */
+  for(const lv of (P.livery||[])) parts.push(VKP.col(lv.c,.3,lv.m??.15)(both(lv.z0??bodyStart-.6, lv.z1??(Ln>0?z1-Ln*(lv.nose??.2):z1-.2), lv.y0, lv.y1, {off:.011, nz:Ln>0?40:4})));
+  const [wl,wh]=P.win;
+  if(P.band){ parts.push(VKP.glass(both(bodyStart+(P.doorsAt?.[0]??0)+.9, bodyEnd-.2, wl, wh, {off:.013}))); }
+  else if(P.winStep){ for(let z=bodyStart+1.4; z<bodyEnd-.9; z+=P.winStep){ if((P.doorsZ||[]).some(d=>Math.abs(d-z)<1.0)) continue; parts.push(VKP.glass(both(z, z+P.winStep*(P.winFill??.72), wl, wh, {off:.013}))); } }
+  /* doors */
+  for(const dz of (P.doorsZ||[])){ const dw=P.doorW??1.3; parts.push(VKP.col(P.doorCol??0x3a3f45,.35,.3)(both(dz-dw/2, dz+dw/2, y0b+.08, wh+.08, {off:.014})));
+    parts.push(VKP.glass(both(dz-dw/2+.1, dz-.06, wl+.05, wh, {off:.016}))); parts.push(VKP.glass(both(dz+.06, dz+dw/2-.1, wl+.05, wh, {off:.016}))); }
+  /* cab windscreen */
+  if(P.noCab){ const g=vkRR(1.2,2.1,.1); g.translate(0,y0b+1.1,z1+.01); parts.push(VKP.dark(g)); }
+  else if(Ln>0){ const a=z1-Ln*(P.ws?.[0]??.62), b=z1-Ln*(P.ws?.[1]??.3), th=P.ws?.[2]??.7; parts.push(VKP.glass(Bd.patch(a,b,th,Math.PI-th,{nz:16,nt:16,off:.012})));
+    for(const s of [1,-1]){ const z=z1-Ln*(P.hl??.1); const y=y0b+(Bd.f.y1(z)-y0b)*.45; parts.push(VKP.col(0xeef4f8,.05,.4)(one(z-.25,z+.12,y-.07,y+.07,s<0,{off:.016}))); } }
+  else { const fs=Bd.sec(z1), cap=(x,y,w,h,r,off=.006)=>{ const g=vkRR(w,h,r); g.translate(x,y,z1+off); return g; };
+    parts.push(VKP.glass(cap(0,((P.fws?.[0]??2.0)+(P.fws?.[1]??3.2))/2,fs.hw*1.7,(P.fws?.[1]??3.2)-(P.fws?.[0]??2.0),.15)));
+    parts.push(VKP.glass(cap(0,((P.fws?.[0]??2.0)+(P.fws?.[1]??3.2))/2,fs.hw*1.72,(P.fws?.[1]??3.2)-(P.fws?.[0]??2.0)+.03,.16,.004)));
+    for(const s of [1,-1]){ parts.push(VKP.col(0xeef4f8,.05,.4)(cap(s*fs.hw*.68,y0b+.55,.36,.14,.05,.009))); parts.push(VKP.tail(cap(s*fs.hw*.68,y0b+.35,.2,.08,.03,.009))); }
+    parts.push(VKP.dark(cap(0,(P.fws?.[1]??3.2)+.18,fs.hw*.9,.22,.04,.008))); parts.push(VKP.amber(cap(0,(P.fws?.[1]??3.2)+.18,fs.hw*.6,.1,.02,.01))); }
+  if(P.cab0){ const rs=Bd.sec(z0), g=vkRR(rs.hw*1.6,1.0,.12); g.rotateY(Math.PI); g.translate(0,y0b+1.7,z0-.006); parts.push(VKP.glass(g)); }
+  else { const g=vkRR(1.2,2.1,.1); g.rotateY(Math.PI); g.translate(0,y0b+1.1,z0-.01); parts.push(VKP.dark(g)); }
+  /* skirt, bogies, wheels */
+  parts.push(VKP.trim(both(bodyStart-.6, z1-(Ln>0?Ln*.35:.2), y0b, y0b+.18, {off:.01})));
+  const BG=P.bogies??[z0+3.2, z1-(Ln>0?Ln+1.4:3.2)], gauge=1.435, wrr=P.wheelR??.46;
+  for(const bz of BG){ parts.push(VKP.dark(vkBox(gauge+.3,.45,3.0,0,wrr+.15,bz,.06))); parts.push(VKP.satin(vkBox(gauge+.55,.18,2.4,0,wrr+.45,bz,.04)));
+    for(const az of [bz-1.25,bz+1.25]) for(const s of [1,-1]){ parts.push(VKP.rimD(vkCyl(wrr,wrr,.12,20,s*gauge/2,wrr,az,0,Math.PI/2))); parts.push(VKP.chrome(vkCyl(wrr*.4,wrr*.4,.14,12,s*gauge/2,wrr,az,0,Math.PI/2))); } }
+  /* roof equipment */
+  if(P.panto){ const pz=P.panto; parts.push(VKP.satin(vkBox(1.2,.25,2.2,0,H+.12,pz,.05))); for(const s of [1,-1]){ const a=new THREE.CylinderGeometry(.03,.03,1.6,6); a.rotateX(s*.9); a.translate(0,H+.75,pz+s*.45); parts.push(VKP.satin(a)); } parts.push(VKP.satin(vkBox(1.7,.05,.12,0,H+1.28,pz))); }
+  if(P.ac) for(const az of P.ac) parts.push(VKP.paint(vkBox(1.9,.32,2.6,0,H+.1,az,.12)));
+  return vkMerge(parts); }
+
+const VK_TRAINS=[
+ {name:"Long flat nose", note:"the Haramain style, green and gold", paint:0xf4f4f2, P:{L:20,nose:7.2,H:3.85,floor:1.05,nk:{w1:.82,w2:.42,w3:.12,t1:.3,t2:.22,t3:.08},ws:[.72,.42,.75],win:[2.05,2.75],winStep:2.05,doorsZ:[-7.3],panto:-3.5,
+   livery:[{y0:1.25,y1:1.45,c:0x1f6b49},{y0:1.47,y1:1.53,c:0xc4a24c,m:.6}]}},
+ {name:"Bullet nose", note:"long pointed, very low tip", paint:0xf6f6f4, P:{L:20,nose:9,H:3.7,floor:1.0,nk:{w1:.8,w2:.4,w3:.08,t1:.22,t2:.28,t3:.1},ws:[.62,.36,.8],win:[2.0,2.6],winStep:1.9,doorsZ:[-7.4],
+   livery:[{y0:1.2,y1:1.6,c:0x2e7d5b},{y0:1.62,y1:1.7,c:0xd7b55a,m:.6}]}},
+ {name:"Rounded classic", note:"short blunt nose, single cab window", paint:0xf2f0ea, P:{L:20,nose:4.2,H:3.95,floor:1.05,nk:{w1:.9,w2:.7,w3:.45,t1:.12,t2:.45,t3:.25},ws:[.8,.35,.62],win:[2.1,2.75],winStep:2.2,doorsZ:[-7.2],panto:-3,
+   livery:[{y0:1.15,y1:2.0,c:0x23476e,nose:.1}]}},
+ {name:"Wedge nose", note:"sharp, angular", paint:0xe9ebee, P:{L:20,nose:6,H:3.9,floor:1.0,e:9,tb:.9,bw:.95,nk:{w1:.88,w2:.6,w3:.3,t1:.2,t2:.3,t3:.12},ws:[.7,.35,.66],win:[2.05,2.75],winStep:2.1,doorsZ:[-7.3],
+   livery:[{y0:1.1,y1:1.35,c:0xb8282e},{y0:1.36,y1:1.42,c:0x333a40}]}},
+ {name:"Duck-bill nose", note:"wide flattened snout", paint:0xf5f5f3, P:{L:20,nose:8,H:3.75,floor:1.0,nk:{w1:.9,w2:.72,w3:.45,t1:.32,t2:.18,t3:.06},ws:[.6,.38,.85],win:[2.0,2.6],winStep:1.95,doorsZ:[-7.3],
+   livery:[{y0:1.18,y1:1.28,c:0x1d5fa8},{y0:1.3,y1:1.34,c:0x1d5fa8}]}},
+ {name:"Two-tone streamliner", note:"dark band through the windows", paint:0xf3f3f1, P:{L:20,nose:6.5,H:3.9,floor:1.05,nk:{w1:.85,w2:.5,w3:.18,t1:.25,t2:.3,t3:.12},ws:[.7,.38,.72],win:[2.05,2.75],band:true,doorsZ:[-7.3],panto:-3.5,
+   livery:[{y0:1.95,y1:2.85,c:0x1b2026}]}},
+ {name:"Desert gold", note:"sand colour, green nose band", paint:0xd9c49a, P:{L:20,nose:7,H:3.85,floor:1.05,nk:{w1:.84,w2:.46,w3:.14,t1:.28,t2:.24,t3:.08},ws:[.7,.4,.74],win:[2.05,2.75],winStep:2.05,doorsZ:[-7.3],
+   livery:[{y0:1.3,y1:1.5,c:0x1f5e45},{y0:3.2,y1:3.4,c:0x1f5e45}]}},
+ {name:"Double-deck intercity", note:"two levels of windows", paint:0xf0f0ee, P:{L:20,nose:4.5,H:4.6,floor:.75,nk:{w1:.9,w2:.68,w3:.4,t1:.15,t2:.48,t3:.28},ws:[.85,.45,.65],win:[1.05,1.75],winStep:1.8,doorsZ:[-7.3],
+   livery:[{y0:2.35,y1:2.95,c:0x24272b},{y0:.85,y1:.95,c:0xb0262c}]}},
+ {name:"Tilting express", note:"slim body, tapered sides", paint:0xeef0f2, P:{L:20,nose:6.5,W:2.8,H:3.7,floor:1.05,tb:.78,bw:.88,nk:{w1:.82,w2:.48,w3:.16,t1:.25,t2:.3,t3:.1},ws:[.68,.38,.74],win:[2.0,2.65],winStep:1.9,doorsZ:[-7.4],
+   livery:[{y0:1.2,y1:1.36,c:0x6c2a7a}]}},
+ {name:"Metallic high-speed", note:"silver with a blue stripe", paint:0xb7bcc2, P:{L:20,nose:7.5,H:3.8,floor:1.0,nk:{w1:.83,w2:.44,w3:.12,t1:.26,t2:.26,t3:.08},ws:[.66,.38,.76],win:[2.05,2.7],winStep:1.9,doorsZ:[-7.4],panto:-3,
+   livery:[{y0:1.4,y1:1.55,c:0x1d4fa0}]}}
+];
+VK_SHOW.train=()=>VK_TRAINS.map(c=>({name:c.name, note:c.note, paint:c.paint, geo:vkRail(c.P), view:[1.0,.3,.9]}));
+
+const VK_METROS=[
+ {name:"Pilgrim metro", note:"wide doors, green stripe", paint:0xf1f1ef, P:{L:22.5,W:3.0,H:3.8,floor:1.1,win:[1.95,2.85],winStep:1.6,winFill:.85,doorsZ:[-6.5,-1.8,2.6,7.1],doorW:1.9,fws:[2.0,3.35],ac:[-4,4.5],
+   livery:[{y0:1.35,y1:1.55,c:0x1f6b49}]}},
+ {name:"Capital metro", note:"rounded cab, dark window band", paint:0xe9ecef, P:{L:22,W:2.9,H:3.75,floor:1.05,nose:2.2,nk:{w1:.95,w2:.82,w3:.62,t1:.06,t2:.55,t3:.35},ws:[.95,.3,.5],win:[1.95,2.8],band:true,doorsZ:[-6.2,-1.6,3.0,7.4],doorW:1.6,ac:[-3,4],
+   livery:[{y0:1.9,y1:2.9,c:0x1b2026},{y0:1.25,y1:1.4,c:0x2f7dd1}]}},
+ {name:"Boxy commuter", note:"stainless, flat front", paint:0xc3c8ce, P:{L:21,W:2.9,H:3.8,floor:1.1,e:14,win:[1.95,2.8],winStep:1.5,winFill:.8,doorsZ:[-6,-2,2,6],doorW:1.4,fws:[2.0,3.2],flatTop:.15,flatPinch:.97,ac:[-5,0,5],
+   livery:[{y0:1.6,y1:1.75,c:0xc0262d}]}},
+ {name:"Driverless people mover", note:"all-glass rounded ends", paint:0xf4f4f2, P:{L:12.5,W:2.8,H:3.5,floor:.9,nose:1.6,nk:{w1:.96,w2:.86,w3:.7,t1:.05,t2:.6,t3:.4},ws:[1,.15,.35],win:[1.6,2.95],band:true,doorsZ:[-2.2,2.2],doorW:1.9,bogies:[-3.5,3.5],ac:[0],
+   livery:[{y0:1.0,y1:1.3,c:0x3e8a68}]}},
+ {name:"Low-floor tram", note:"street running, big glass", paint:0xe8e6df, P:{L:20,W:2.65,H:3.55,floor:.35,nose:1.8,nk:{w1:.96,w2:.84,w3:.66,t1:.05,t2:.55,t3:.3},ws:[1,.2,.45],win:[1.0,2.6],winStep:1.7,winFill:.88,doorsZ:[-5.5,0,5.2],doorW:1.3,bogies:[-6.5,6.0],wheelR:.3,ac:[-3,3],
+   livery:[{y0:.4,y1:.85,c:0x7a2733}]}},
+ {name:"Monorail", note:"rides on a beam", paint:0xf2f2f0, P:{L:16,W:2.9,H:3.7,floor:.9,nose:2.6,nk:{w1:.93,w2:.76,w3:.5,t1:.08,t2:.5,t3:.25},ws:[.95,.3,.5],win:[1.7,2.8],band:true,doorsZ:[-3.5,2.5],doorW:1.5,bogies:[],ac:[-1],
+   livery:[{y0:.95,y1:1.45,c:0x2a6bb0}]}},
+ {name:"Gold-line metro", note:"warm colours, framed windows", paint:0xf0ebe0, P:{L:22,W:3.0,H:3.8,floor:1.1,win:[1.95,2.85],winStep:1.7,winFill:.7,doorsZ:[-6.3,-1.8,2.8,7.2],doorW:1.7,doorCol:0xb08a3c,fws:[2.0,3.3],ac:[-4,4],
+   livery:[{y0:1.3,y1:1.5,c:0xb08a3c,m:.5},{y0:3.2,y1:3.35,c:0xb08a3c,m:.5}]}},
+ {name:"Panoramic metro", note:"tall windows, slim pillars", paint:0xeef0f1, P:{L:22,W:3.0,H:3.8,floor:1.05,nose:1.4,nk:{w1:.97,w2:.88,w3:.75,t1:.04,t2:.55,t3:.35},ws:[1,.2,.45],win:[1.55,3.1],winStep:1.45,winFill:.9,doorsZ:[-6.3,-1.8,2.8,7.2],doorW:1.7,ac:[-4,4],
+   livery:[{y0:1.15,y1:1.35,c:0x0f7a7a}]}},
+ {name:"Heavy metro", note:"long car, five doors", paint:0xe2e5e8, P:{L:24,W:3.1,H:3.85,floor:1.15,e:12,win:[2.0,2.85],winStep:1.4,winFill:.82,doorsZ:[-8.2,-4.1,0,4.1,8.2],doorW:1.5,fws:[2.05,3.35],flatTop:.2,ac:[-6,6],
+   livery:[{y0:1.4,y1:1.6,c:0x1f4fa0}]}},
+ {name:"Sloped-front metro", note:"raked windscreen, red stripe", paint:0xf3f3f1, P:{L:22,W:2.95,H:3.8,floor:1.1,nose:2.8,nk:{w1:.95,w2:.85,w3:.72,t1:.1,t2:.42,t3:.3},ws:[.9,.25,.5],win:[1.95,2.85],winStep:1.6,winFill:.82,doorsZ:[-6,-1.6,2.8],doorW:1.6,ac:[-3,3.5],
+   livery:[{y0:1.3,y1:1.5,c:0xc0262d}]}}
+];
+VK_SHOW.metro=()=>VK_METROS.map(c=>({name:c.name, note:c.note, paint:c.paint, geo:vkRail(c.P), view:[1.0,.3,.9]}));
+
+/* ---------- airliners. Nose at +z, ground y=0, gear down ---------- */
+function vkRings(R, capEnd=true){ const n=R[0].length, pos=[], idx=[]; R.forEach(r=>r.forEach(p=>pos.push(...p)));
+  for(let i=0;i<R.length-1;i++) for(let j=0;j<n;j++){ const a=i*n+j, b=i*n+(j+1)%n, c=(i+1)*n+j, d=(i+1)*n+(j+1)%n; idx.push(a,c,b, b,c,d); }
+  const g=new THREE.BufferGeometry(); g.setAttribute("position",new THREE.Float32BufferAttribute(pos,3)); g.setIndex(idx); g.computeVertexNormals(); const L=[g.toNonIndexed()];
+  if(capEnd){ const r=R[R.length-1], c=[0,0,0]; r.forEach(p=>{ c[0]+=p[0]/n; c[1]+=p[1]/n; c[2]+=p[2]/n; }); const P=[]; for(let j=0;j<n;j++){ const a=r[j], b=r[(j+1)%n]; P.push(...c,...b,...a); }
+    const cg=new THREE.BufferGeometry(); cg.setAttribute("position",new THREE.Float32BufferAttribute(P,3)); cg.computeVertexNormals(); L.push(cg); }
+  return vkMerge(L); }
+/* an airfoil ring in a plane: chord along -z from the leading edge, thickness along "up" */
+function vkFoil(c, t, n=18){ const P=[]; for(let i=0;i<n;i++){ const a=i/n*Math.PI*2, u=(1-Math.cos(a))/2, s=Math.sin(a)>=0?1:-1; const th=t*c*(1.1*Math.sqrt(Math.max(u,0))-u*1.0-u*u*.1)*1.25; P.push([u*c, s*Math.max(th,0)]); } return P; }
+/* a lifting surface: stations along a span direction; each station gives LE point, chord, thickness. axis: "x" (wing) or "y" (fin) */
+function vkSurface(st, t, axis="x", side=1){ const R=st.map(s=>{ const F=vkFoil(s.c,t); return F.map(([u,v])=> axis==="x" ? [s.x*side, s.y+v, s.z-u] : [s.x+v, s.y, s.z-u]); });
+  if(axis==="x" && side<0) R.forEach(r=>r.reverse()); if(axis==="y") R.forEach(r=>r.reverse()); return vkRings(R); }
+function vkWingSet(o){ // o: {root:[x,y,z], span, c0, c1, sweep, dih, t, tip:"blend"|"raked"|"curve"|"scimitar"|"none"}
+  const L=[], N=10, st=[]; for(let i=0;i<=N;i++){ const f=i/N, s=o.span*f, kink=o.kink??.33, c=f<kink ? o.c0+(o.ck??o.c0*.62-o.c0)*(f/kink) : (o.ck??o.c0*.62)+(o.c1-(o.ck??o.c0*.62))*((f-kink)/(1-kink));
+    const zle=o.root[2]-Math.tan(o.sweep*Math.PI/180)*s + (f<kink? (o.c0-c)*.0 : 0); st.push({x:o.root[0]+s, y:o.root[1]+Math.tan(o.dih*Math.PI/180)*s, z:zle, c}); }
+  if(o.tip==="raked"){ const t0=st[N]; for(let k=1;k<=3;k++) st.push({x:t0.x+k*o.span*.03, y:t0.y+k*.04, z:t0.z-k*o.span*.03*1.4-k*.1, c:t0.c*(1-k*.25)}); }
+  for(const sd of [1,-1]){ L.push(o.paint(vkSurface(st,o.t,"x",sd)));
+    const tp=st[st.length-1]; if(o.tip==="blend"||o.tip==="curve"||o.tip==="scimitar"){ const h=o.wingletH??(o.span*.08), wst=[]; for(let k=0;k<=4;k++){ const f=k/4, bend=o.tip==="curve"?Math.sin(f*Math.PI/2):f; wst.push({x:(tp.x+h*.25*(1-Math.cos(f*Math.PI/2)))*sd, y:tp.y+h*bend, z:tp.z-f*tp.c*.6, c:tp.c*(1-f*.55)}); }
+      const R=wst.map(s=>vkFoil(s.c,.08).map(([u,v])=>[s.x+v*sd, s.y, s.z-u])); if(sd<0) R.forEach(r=>r.reverse()); else R.forEach(r=>r.reverse()); L.push((o.tipPaint||o.paint)(vkRings(R)));
+      if(o.tip==="scimitar"){ const R2=[0,1,2].map(k=>vkFoil(tp.c*(.6-k*.2),.08).map(([u,v])=>[ (tp.x)*sd+v*sd, tp.y-k*.45, tp.z-tp.c*.15-k*.25-u])); L.push((o.tipPaint||o.paint)(vkRings(R2))); } } }
+  return {geo:vkMerge(L), st}; }
+function vkNacelle(r, len, o={}){ const prof=[]; const N=14; for(let i=0;i<=N;i++){ const f=i/N; const rr=r*(f<.15? .88+.12*Math.sin(f/.15*Math.PI/2) : 1-.28*Math.pow((f-.15)/.85,1.6)); prof.push(new THREE.Vector2(rr, -f*len)); }
+  const g=new THREE.LatheGeometry(prof.map(v=>new THREE.Vector2(v.x,v.y)),28); g.rotateX(Math.PI/2); const L=[(o.paint||VKP.paint)(g)];
+  const fan=new THREE.CircleGeometry(r*.86,28); L.push(VKP.dark(fan)); const sp=new THREE.ConeGeometry(r*.24,r*.45,16); sp.rotateX(Math.PI/2); sp.translate(0,0,.05); L.push(VKP.col(0xdfe2e5,.25,.6)(sp));
+  const ex=new THREE.CylinderGeometry(r*.5,r*.3,len*.3,20); ex.rotateX(Math.PI/2); ex.translate(0,0,-len*1.08); L.push(VKP.satin(ex));
+  const lip=new THREE.TorusGeometry(r*.94,r*.07,8,28); L.push(VKP.chrome(lip)); return vkMerge(L); }
+function vkPlane(P){ const L=P.L, R=P.R, z0=-L/2, z1=L/2, parts=[], cy=P.cy??R+1.6, Ln=P.nose??R*2.2, Lt=P.tail??R*3.6, vr=P.vR??1;
+  const rK=[[z0,R*.12],[z0+Lt*.5,R*.62],[z0+Lt,R*.98],[z0+Lt+2,R],[z1-Ln,R],[z1-Ln*.55,R*.9],[z1-Ln*.2,R*.6],[z1,R*.08]];
+  const cK=[[z0,cy+R*.62],[z0+Lt*.5,cy+R*.32],[z0+Lt,cy+R*.03],[z0+Lt+2,cy],[z1-Ln,cy],[z1-Ln*.4,cy-R*.06],[z1,cy-R*.32]];
+  const fr=vkMono(rK), fc=vkMono(cK), hump=P.hump?vkMono(P.hump):()=>0;
+  const Bd=vkBody({z:[z0,z1], nz:120, nt:48, e:2, tb:1, bw:1, hw:rK, y0:cK.map(([z])=>[z,fc(z)-fr(z)*(P.belly??1)]), y1:cK.map(([z])=>[z,fc(z)+fr(z)*vr+hump(z)]).concat(P.hump?P.hump.map(([z,h])=>[z,fc(z)+fr(z)*vr+h]):[]).sort((a,b)=>a[0]-b[0])});
+  parts.push(VKP.paint(Bd.geo()));
+  const one=(za,zb,ya,yb,neg,o2={})=>Bd.patch(za,zb,z=>Bd.thY(z,neg?yb:ya,neg),z=>Bd.thY(z,neg?ya:yb,neg),{nt:6,off:.02,...o2});
+  const both=(za,zb,ya,yb,o2)=>vkMerge([one(za,zb,ya,yb,false,o2),one(za,zb,ya,yb,true,o2)]);
+  /* livery */
+  for(const lv of (P.livery||[])){ const c=VKP.col(lv.c,.3,lv.m??.2); if(lv.belly) parts.push(c(Bd.patch(lv.z0??z0+2,lv.z1??z1-1.2,z=>Bd.thY(z,fc(z)+fr(z)*lv.belly,true),z=>Bd.thY(z,fc(z)+fr(z)*lv.belly)+Math.PI*2,{nt:20,off:.015})));
+    else parts.push(c(both(lv.z0??z0+Lt*.6, lv.z1??z1-Ln*.4, lv.y0, lv.y1, {off:.016}))); }
+  /* cabin windows */
+  const wy=cy+R*(P.winY??.28), ws=P.winStep??.53; const win=[]; const decks=[wy].concat(P.deck2?[cy+R*P.deck2]:[]);
+  for(const y of decks) for(let z=z0+Lt+(P.winStart??1.5); z<z1-Ln-(P.winEnd??.6); z+=ws){ if((P.gapsZ||[]).some(g=>Math.abs(g-z)<.9)) continue; for(const s of [1,-1]){ const th=Bd.thY(z,y,s<0), p=Bd.at(z,th), n=Bd.normal(z,th); const g=vkRR(.24,.34,.1,2); g.lookAt(new THREE.Vector3(n[0],n[1],n[2])); g.translate(p[0]+n[0]*.02,p[1]+n[1]*.02,p[2]+n[2]*.02); win.push(g); } }
+  if(VKQ>=.3) parts.push(VKP.dark(vkMerge(win)));
+  for(const dz of (P.doors||[])) parts.push(VKP.dark(vkMerge([one(dz-.55,dz-.52,cy-R*.2,cy+R*.55,false,{off:.022}),one(dz+.52,dz+.55,cy-R*.2,cy+R*.55,false,{off:.022}),one(dz-.55,dz-.52,cy-R*.2,cy+R*.55,true,{off:.022}),one(dz+.52,dz+.55,cy-R*.2,cy+R*.55,true,{off:.022})])));
+  /* cockpit */
+  const cz0=z1-Ln*.66, cz1=z1-Ln*.5, hk=(z,k)=>fc(z)+fr(z)*k;
+  parts.push(VKP.dark(Bd.patch(z1-Ln*.6,z1-Ln*.5,z=>Bd.thY(z,hk(z,.3)),z=>Math.PI-Bd.thY(z,hk(z,.3)),{nz:6,nt:16,off:.02})));
+  parts.push(VKP.dark(vkMerge([one(cz0,z1-Ln*.6,hk(z1-Ln*.6,.12),hk(z1-Ln*.6,.42),false,{off:.02}), one(cz0,z1-Ln*.6,hk(z1-Ln*.6,.12),hk(z1-Ln*.6,.42),true,{off:.02})])));
+  if(P.mask) parts.push(VKP.dark(vkMerge([one(cz0-.5,cz1,hk(cz0,.05),hk(cz0,.5),false,{off:.018}),one(cz0-.5,cz1,hk(cz0,.05),hk(cz0,.5),true,{off:.018})])));
+  parts.push(VKP.paint(Bd.patch(z1-Ln*.6,z1-Ln*.5,Math.PI/2-.03,Math.PI/2+.03,{nz:4,nt:1,off:.026})));
+  /* wings and engines */
+  const wz=P.wingZ??(z0+L*.55), wy0=cy-R*.55, wingPaint=VKP.col(0xc8ccd1,.35,.3);
+  const W=vkWingSet({root:[R*.7,wy0,wz], span:P.span/2-R*.7, c0:P.c0, c1:P.c1, ck:P.ck, sweep:P.sweep, dih:P.dih??5, t:P.t??.12, tip:P.tip||"blend", paint:wingPaint, tipPaint:P.tipCol?VKP.col(P.tipCol,.35,.2):wingPaint, wingletH:P.wingletH});
+  parts.push(W.geo);
+  parts.push(VKP.col(0xb9bec4,.4,.2)(vkMerge([vkBox(R*1.5,R*.4,P.c0*1.05,0,cy-R*.75,wz-P.c0*.5,.3)]))); // wing-body fairing
+  for(const e of (P.engines||[])){ const s=W.st[Math.round(e.f*10)], er=P.engR, el=P.engL??er*3.6; for(const sd of [1,-1]){ const g=vkNacelle(er,el,{paint:P.engCol?VKP.col(P.engCol,.3,.3):VKP.paint}); g.translate(sd*s.x, s.y-er*1.15, s.z+el*.55); parts.push(g);
+      parts.push(wingPaint(vkBox(er*.35,er*.9,el*.75,sd*s.x,s.y-er*.45,s.z+el*.05,.08))); } }
+  if(P.rearEngines){ const er=P.engR, el=P.engL??er*3.4; for(const sd of [1,-1]){ const g=vkNacelle(er,el); g.translate(sd*(R+er*1.25), cy+R*.35, z0+Lt*1.15+el*.5); parts.push(g); parts.push(wingPaint(vkBox(er*1.2,er*.35,el*.6,sd*(R+er*.4),cy+R*.35,z0+Lt*1.15,.05))); } }
+  /* tail */
+  const fh=P.finH??R*2.6, fc0=P.finC??Lt*.62, fz=z0+Lt*(P.finZ??.95), fsw=P.finSweep??38, fst=[];
+  for(let i=0;i<=6;i++){ const f=i/6; fst.push({x:0, y:fc(fz)+fr(fz)*.6+f*fh, z:fz-Math.tan(fsw*Math.PI/180)*f*fh, c:fc0*(1-.62*f)}); }
+  parts.push((P.finCol?VKP.col(P.finCol,.3,.2):VKP.paint)(vkSurface(fst,.1,"y")));
+  const hs=P.hsSpan??R*3.4, hz=P.tTail? fst[6].z+.2 : z0+Lt*(P.hsZ??.55), hy=P.tTail? fst[6].y-.1 : fc(z0+Lt*.5)+fr(z0+Lt*.5)*.1;
+  const H=vkWingSet({root:[P.tTail?.05:R*.35,hy,hz], span:hs, c0:P.hsC??Lt*.4, c1:(P.hsC??Lt*.4)*.42, sweep:P.hsSweep??33, dih:P.tTail?0:6, t:.1, tip:"none", paint:P.hsCol?VKP.col(P.hsCol,.3,.2):wingPaint}); parts.push(H.geo);
+  /* landing gear */
+  const gearY=cy-R; const noseZ=z1-Ln*.75, mainZ=wz-P.c0*.55;
+  parts.push(VKP.satin(vkCyl(.08,.08,gearY,8,0,gearY/2,noseZ))); for(const s of [1,-1]) parts.push(VKP.tyre(vkCyl(.4,.4,.25,16,s*.18,.4,noseZ,0,Math.PI/2)));
+  const mg=P.mainGear??[{x:R*.85, n:1}]; for(const m of mg) for(const s of [1,-1]){ const x=s*m.x; parts.push(VKP.satin(vkCyl(.13,.13,gearY,8,x,gearY/2,mainZ)));
+    const rows=m.n||1; for(let r2=0;r2<rows;r2++) for(const k of [-1,1]) parts.push(VKP.tyre(vkCyl(.62,.62,.38,18,x+k*.33,.62,mainZ+(r2-(rows-1)/2)*1.45,0,Math.PI/2))); }
+  return vkMerge(parts); }
+
+const GR=0x1f6b49, GD=0xc4a24c;
+const VK_PLANES=[
+ {name:"Narrow-body twin", note:"the short-haul workhorse", P:{L:37.6,R:1.98,span:35.8,c0:6.2,c1:1.5,sweep:25,engines:[{f:.35}],engR:1.0,tip:"blend",wingletH:2.2,doors:[15.6,-15.0],finCol:GR,tipCol:GR,
+   livery:[{y0:2.9,y1:3.15,c:GR,z0:-12,z1:12},{y0:3.15,y1:3.22,c:GD,z0:-12,z1:12,m:.6}]}},
+ {name:"Stretched narrow-body", note:"longer, more doors", P:{L:44.5,R:1.98,span:35.8,c0:6.4,c1:1.5,sweep:25,engines:[{f:.35}],engR:1.05,tip:"blend",wingletH:2.2,doors:[19,6.5,-5.5,-18.4],finCol:GR,tipCol:GR,
+   livery:[{belly:-.05,c:0xb9bec3,z0:-14,z1:17}]}},
+ {name:"Slim single-aisle", note:"pointed tail, split wingtips", P:{L:39.5,R:1.88,span:35.9,c0:6,c1:1.3,sweep:25,engines:[{f:.33}],engR:1.0,tip:"scimitar",wingletH:2.4,tail:9,doors:[16.6,-16],finCol:GR,engCol:GR,
+   livery:[{y0:2.0,y1:2.6,c:GR,z0:-11,z1:14}]}},
+ {name:"Long-range twin", note:"big engines, raked wingtips", P:{L:73.9,R:3.1,cy:5.1,span:64.8,c0:13,c1:2.5,sweep:31.6,engines:[{f:.32}],engR:1.75,engL:6.8,tip:"raked",doors:[29.5,19,0,-21.5],mainGear:[{x:5.5,n:3}],finCol:GR,hsC:7,hsSpan:10,
+   livery:[{y0:4.9,y1:5.35,c:GR,z0:-26,z1:30},{y0:5.37,y1:5.47,c:GD,z0:-26,z1:30,m:.6}]}},
+ {name:"Composite twin", note:"smooth nose, long flexed wings", P:{L:62.8,R:2.9,cy:4.8,span:60,c0:11,c1:1.8,sweep:32,dih:7,engines:[{f:.31}],engR:1.5,engL:6.2,tip:"raked",nose:7.5,doors:[25,15,-2,-19],mainGear:[{x:4.7,n:2}],finCol:GR,engCol:GR,hsC:6.5,hsSpan:9,
+   livery:[{belly:-.15,c:0xd9dde1,z0:-22,z1:26}]}},
+ {name:"Wide-body classic twin", note:"blended winglets", P:{L:63.7,R:2.82,cy:4.7,span:60.3,c0:11,c1:2.2,sweep:30,engines:[{f:.33}],engR:1.45,engL:5.6,tip:"blend",wingletH:2.7,doors:[25,15,-2,-20],mainGear:[{x:4.6,n:2}],finCol:GR,tipCol:GR,hsC:6.5,hsSpan:9.5,
+   livery:[{y0:4.3,y1:4.9,c:GR,z0:-23,z1:26}]}},
+ {name:"Curved-tip wide-body", note:"dark window mask, curved winglets", P:{L:66.8,R:2.98,cy:4.9,span:64.75,c0:12,c1:2.0,sweep:31.9,engines:[{f:.32}],engR:1.6,engL:6.2,tip:"curve",wingletH:3.2,mask:true,doors:[26,16,-2,-21],mainGear:[{x:5,n:2}],finCol:GR,tipCol:GR,hsC:7,hsSpan:10,
+   livery:[{belly:-.1,c:0xc9ced3,z0:-24,z1:27}]}},
+ {name:"Jumbo four-engine", note:"upper-deck hump", P:{L:76.3,R:3.25,cy:5.4,span:68.4,c0:14,c1:3,sweep:37.5,engines:[{f:.28},{f:.6}],engR:1.45,engL:5.8,tip:"raked",doors:[30,21,4,-12,-24],mainGear:[{x:2.0,n:2},{x:5.5,n:2}],finCol:GR,hsC:8,hsSpan:11,
+   hump:[[16,0],[22,1.5],[30,1.6],[34.5,.9],[36,.2]],nose:9,livery:[{y0:5.2,y1:5.6,c:GR,z0:-28,z1:22}]}},
+ {name:"Double-deck superjumbo", note:"two full decks, four engines", P:{L:72.7,R:3.6,vR:1.32,cy:5.6,span:79.8,c0:17,c1:4,sweep:33.5,engines:[{f:.3},{f:.6}],engR:1.6,engL:6.4,tip:"blend",wingletH:2.4,deck2:.95,doors:[28,18,0,-18],mainGear:[{x:2.2,n:3},{x:6,n:2}],finCol:GR,tipCol:GR,hsC:9,hsSpan:15,
+   nose:8.5,livery:[{belly:-.05,c:0xc5cacf,z0:-26,z1:28}]}},
+ {name:"Regional jet", note:"rear engines and a T-tail", P:{L:32.5,R:1.4,cy:2.5,span:26,c0:4.6,c1:1.1,sweep:26,tip:"blend",wingletH:1.6,rearEngines:true,engR:.72,engL:3.4,tTail:true,finH:4.6,finC:5.2,finSweep:42,hsC:2.8,hsSpan:4.6,hsSweep:30,doors:[13.4,-11.5],wingZ:-1.5,finCol:GR,tipCol:GR,
+   livery:[{y0:2.5,y1:2.75,c:GR,z0:-9,z1:12}]}}
+];
+VK_SHOW.plane=()=>VK_PLANES.map(c=>({name:c.name, note:c.note, paint:0xf6f6f4, geo:vkPlane(c.P), view:[1.0,.42,.75]}));
+
+/*VKIT-END*/
 /*VEH-START*/
 /* =========================================================
    Vehicles: lofted bodies with real proportions (coach, sedan,
@@ -4456,7 +4910,8 @@ function paintable(mat){ mat.onBeforeCompile=sh=>{ sh.vertexShader=sh.vertexShad
     .replace("#include <common>","#include <common>\nattribute float paint;")
     .replace("vColor.xyz *= instanceColor.xyz;","vColor.xyz *= mix(vec3(1.0), instanceColor.xyz, paint);"); };
   mat.customProgramCacheKey=()=>"paint1"; return mat; }
-const vehMat=paintable(new THREE.MeshStandardMaterial({vertexColors:true, roughness:.38, metalness:.25, envMapIntensity:1.1}));
+const vehMat=VK_MAT; // one material for every vehicle: colour, paint mask and roughness/metalness come per vertex
+const vkPbr=(g,r=.38,m=.25)=>{ if(!g.attributes.pbr){ const n=g.attributes.position.count, a=new Float32Array(n*2); for(let i=0;i<n;i++){ a[i*2]=r; a[i*2+1]=m; } g.setAttribute("pbr",new THREE.BufferAttribute(a,2)); } if(!g.attributes.paint) g.setAttribute("paint",new THREE.BufferAttribute(new Float32Array(g.attributes.position.count),1)); return g; };
 const VC={ body:0xffffff, glass:0x1a2128, glassL:0x2b3742, trim:0x2a2c2f, chrome:0xc9ccd0, tyre:0x161616, rim:0xb9bdc2, head:0xeef2f5, tail:0xb3141b, amber:0xe39a1c, green:0x1f7a55, gold:0xc9a24a, grey:0x6d7176, black:0x0e0f10 };
 /* attach colour and paint attributes */
 function colorize(g, hex, paint=0){ g=g.index?g.toNonIndexed():g; const n=g.attributes.position.count, c=new THREE.Color(hex), a=new Float32Array(n*3), p=new Float32Array(n).fill(paint);
@@ -4649,10 +5104,18 @@ function makeGondola(){ const parts=[];
   return vmerge(parts); }
 
 /* shared instanced vehicle sets */
-const VEH={ coach:makeCoach(), coachLow:makeCoachLow(), sedan:makeCar("sedan"), suv:makeCar("suv"), pickup:makeCar("pickup"), van:makeCar("van"), carLow:makeCarLow(),
-  metroCab:makeMetroCar(true), metroCar:makeMetroCar(false), hsrPower:makeHSR("power"), hsrCoach:makeHSR("coach"), plane:makeAirliner(), ship:makeShip(), gondola:makeGondola() };
-
-App._veh=VEH;
+/* the fleet, chosen from the design sheets: all ten cars mixed in traffic, coaches 3, 4 and 10,
+   the wedge-nose high-speed train, the gold-line metro and the slim single-aisle airliner */
+const VEH={ ship:vkPbr(makeShip()), gondola:vkPbr(makeGondola()) }, CAR_KEYS=[], BUS_KEYS=[], VEH_LO={};
+{ const TR=VK_TRAINS[3].P, MT={...VK_METROS[6].P, L:22.5};
+  VKQ=.42; VK_CARS.forEach((c,i)=>{ VEH["car"+i]=vkCar(c.P); CAR_KEYS.push("car"+i); }); [2,3,9].forEach((bi,j)=>{ VEH["bus"+j]=vkBus(VK_BUSES[bi].P); BUS_KEYS.push("bus"+j); });
+  VKQ=.6; VEH.metroCab=vkRail(MT); VEH.metroCar=vkRail({...MT, noCab:true}); VEH.hsrPower=vkRail(TR); VEH.hsrCoach=vkRail({...TR, L:13.1, nose:0, noCab:true, doorsZ:[-5.6], panto:0});
+  VKQ=1; VEH.plane=vkPlane(VK_PLANES[2].P);
+  VKQ=.12; CAR_KEYS.forEach((k,i)=>VEH_LO[k]=vkCar(VK_CARS[i].P)); [2,3,9].forEach((bi,j)=>VEH_LO["bus"+j]=vkBus(VK_BUSES[bi].P)); VKQ=.25; VEH_LO.plane=vkPlane(VK_PLANES[2].P); VKQ=1;
+  VEH.sedan=VEH.car0; VEH.suv=VEH.car3; VEH.pickup=VEH.car6; VEH.van=VEH.car7; VEH.coach=VEH.bus0; VEH.coachLow=VEH_LO.bus0; VEH.carLow=VEH_LO.car0;
+  for(const k of [...CAR_KEYS,...BUS_KEYS]){ VEH[k].computeBoundingBox(); VEH[k].userData.len=VEH[k].boundingBox.max.z-VEH[k].boundingBox.min.z; } }
+const VEH_KEY=new Map([...CAR_KEYS,...BUS_KEYS,"plane"].map(k=>[VEH[k],k]));
+App._veh=VEH; App._vehMat=vehMat; App._r.THREE=THREE;
 /* ---------- interiors for rides ----------
    Curved shells with real window reveals, padded seats, bins, curtains and
    lighting, built from a few parametric pieces. Every cabin faces +z. */
@@ -4779,27 +5242,24 @@ function tiedCurtain(h){ const parts=[]; for(let i=0;i<4;i++){ const c=new THREE
     for(let j=0;j<p.count;j++){ const y=p.getY(j)/h+.5, pinch=1-.55*Math.exp(-((y-.45)**2)/.01); p.setX(j,p.getX(j)*pinch+ (i-1.5)*.035*pinch); p.setZ(j,p.getZ(j)*pinch); }
     c.computeVertexNormals(); parts.push(c.translate(0,h/2,0)); } return mergeGeometries(parts); }
 
-/* ---------- airliner cabin: wide-body, 3-3-3 ---------- */
-const PLANE_XS=[-2.40,-1.92,-1.44, -.475,0,.475, 1.44,1.92,2.40];
+/* ---------- airliner cabin: single aisle, 3-3, matching the slim single-aisle airliner outside ---------- */
+const PLANE_XS=[-1.52,-1.06,-.6, .6,1.06,1.52];
 function planeCabin(){ const g=new THREE.Group(); g.visible=false; scene.add(g);
-  const L=30, R=2.95, cy=1.0, A={L,R,cy,hw:R,th0:Math.asin(-cy/R)+.003,th1:Math.asin((1.86-cy)/R),pitch:.535,win:{y:1.25,w:.27,h:.39,r:.12,taper:.86},dep:.17,shade:.35};
+  const L=30, R=1.95, cy=.62, A={L,R,cy,hw:R,th0:Math.asin(-cy/R)+.003,th1:Math.asin((1.6-cy)/R),pitch:.535,win:{y:1.05,w:.25,h:.36,r:.11,taper:.86},dep:.14,shade:.35};
   for(const sd of [-1,1]){ arcWall(g,A,sd); arcWall(g,{...A,th1:A.th0+.16/R,win:null,mat:IM.plastic2,R:R-.01},sd); }
   const fw=Math.sqrt(R*R-cy*cy); const fl=new THREE.Mesh(new THREE.BoxGeometry(fw*2,.06,L), IM.floor); fl.position.y=-.03; fl.receiveShadow=true; g.add(fl);
-  // side bins: lip, door, top meeting the wall
-  const wy=y=>Math.sqrt(R*R-(y-cy)**2), bin=[[wy(1.86)+.02,1.86],[1.98,1.86],[1.93,1.92],[1.9,2.05],[1.92,2.22],[2.0,2.34],[2.08,2.38],[wy(2.38)+.02,2.38]];
-  for(let y=2.3;y>1.86;y-=.08) bin.push([wy(y)+.02,y]); profileZ(g,bin,L,IM.wall);
-  // reading-light strip under the bins, cove light along the top
-  for(const sd of [-1,1]){ const psu=new THREE.Mesh(new THREE.BoxGeometry(.62,.02,L), IM.trim); psu.position.set(sd*2.36,1.85,0); g.add(psu);
-    const cv=new THREE.Mesh(new THREE.BoxGeometry(.03,.012,L), IM.cove); cv.position.set(sd*2.06,2.392,0); g.add(cv); }
+  // overhead bins in the upper corners, their lips over the outer seats
+  const wy=y=>Math.sqrt(R*R-(y-cy)**2), bin=[[wy(1.6)+.02,1.6],[1.02,1.6],[.97,1.66],[.95,1.8],[.98,1.94],[1.06,2.04],[wy(2.06)+.02,2.06]];
+  for(let y=2.0;y>1.6;y-=.07) bin.push([wy(y)+.02,y]); profileZ(g,bin,L,IM.wall);
+  for(const sd of [-1,1]){ const psu=new THREE.Mesh(new THREE.BoxGeometry(.5,.02,L), IM.trim); psu.position.set(sd*1.28,1.59,0); g.add(psu);
+    const cv=new THREE.Mesh(new THREE.BoxGeometry(.03,.012,L), IM.cove); cv.position.set(sd*1.04,2.05,0); g.add(cv); }
   const gasp=new THREE.InstancedMesh(new THREE.CylinderGeometry(.026,.03,.025,12), IM.plastic2, 34*6), rl=new THREE.InstancedMesh(new THREE.CylinderGeometry(.018,.018,.012,10), IM.light, 34*6); let k=0;
-  for(let r=0;r<34;r++) for(const x of [-2.4,-1.92,-1.44,1.44,1.92,2.4]){ const z=-13.5+r*.82+.25; setInst(gasp,k,x,1.83,z); setInst(rl,k,x+(x<0?.08:-.08),1.835,z+.05,rand()<.25?1:.001); k++; } g.add(gasp,rl);
-  // center bins and the ceiling between them
-  profileZ(g,[[-1.0,1.98],[1.0,1.98],[1.07,2.05],[1.08,2.24],[1.0,2.44],[-1.0,2.44],[-1.08,2.24],[-1.07,2.05]],L,IM.wall,false);
-  const cA={L,R:9.6,cy:2.62-9.6,hw:9.6,th0:Math.PI/2-.22,th1:Math.PI/2+.22}; arcSurf(g,cA,IM.ceil);
-  for(const sd of [-1,1]){ const c2=new THREE.Mesh(new THREE.BoxGeometry(.035,.012,L), IM.cove); c2.position.set(sd*1.04,2.448,0); g.add(c2); }
-  seatRows(g, 34, -13.5, .82, PLANE_XS, .82, [[-2.4,-3.66],[-1.92,-3.66],[-1.44,-3.66],[-2.4,-2.84]], {screen:true, edge:false});
-  bulkhead(g, 15.1, fw, 2.5, 1, {door:[0,.9,2.0], curtain:IM.curtain, sign:[0,2.3]}); bulkhead(g,-15.1,fw,2.5,-1,{door:[0,.9,2.0], curtain:IM.curtain});
-  g.userData.eye=[2.3,1.18,.2]; g.userData.lift=0; return g; }
+  for(let r=0;r<34;r++) for(const x of PLANE_XS){ const z=-13.5+r*.82+.25; setInst(gasp,k,x*.88,1.57,z); setInst(rl,k,x*.88+(x<0?.06:-.06),1.575,z+.05,rand()<.25?1:.001); k++; } g.add(gasp,rl);
+  // the ceiling arching over the aisle between the bins
+  const cA={L,R:4.2,cy:2.26-4.2,hw:4.2,th0:Math.PI/2-.27,th1:Math.PI/2+.27}; arcSurf(g,cA,IM.ceil);
+  seatRows(g, 34, -13.5, .82, PLANE_XS, .82, [[-1.52,-3.66],[-1.06,-3.66],[-.6,-3.66],[-1.52,-2.84]], {screen:true, edge:false});
+  bulkhead(g, 15.1, fw, 2.25, 1, {door:[0,.9,1.95], curtain:IM.curtain, sign:[0,2.1]}); bulkhead(g,-15.1,fw,2.25,-1,{door:[0,.9,1.95], curtain:IM.curtain});
+  g.userData.eye=[1.45,1.18,.2]; g.userData.lift=0; return g; }
 
 /* ---------- Hajj coach: 2+2, curtains, racks, big windscreen ---------- */
 function coachInterior(){ const g=new THREE.Group(); g.visible=false; scene.add(g);
@@ -4870,10 +5330,10 @@ const trainCab=new THREE.InstancedMesh(VEH.metroCab, vehMat, 2*TRAINS.length), t
 [trainCab,trainCar].forEach(m=>{ m.castShadow=true; m.frustumCulled=false; const c=new THREE.Color(0xf4f4f2); for(let i=0;i<m.count;i++) m.setColorAt(i,c); scene.add(m); });
 
 /* buses and cars on the roads: detailed near the camera, simple further away */
-const BUSN=150, CARN=320, CAR_KINDS=["sedan","suv","sedan","pickup","suv","van","sedan"];
-const buses=new THREE.InstancedMesh(VEH.coach, vehMat, BUSN), busesLow=new THREE.InstancedMesh(VEH.coachLow, vehMat, BUSN), carsLow=new THREE.InstancedMesh(VEH.carLow, vehMat, CARN);
-const carHi={}; for(const k of new Set(CAR_KINDS)) carHi[k]=new THREE.InstancedMesh(VEH[k], vehMat, CARN);
-const TRAFFIC_MESHES=[buses,busesLow,carsLow,...Object.values(carHi)];
+const BUSN=150, CARN=320, CAR_KINDS=CAR_KEYS;
+/* one detailed and one distant mesh per design; slots are handed out every frame, so unused capacity costs nothing */
+const vHi={}, vLo={}; for(const k of [...CAR_KEYS,...BUS_KEYS]){ const n=BUS_KEYS.includes(k)?BUSN:CARN; vHi[k]=new THREE.InstancedMesh(VEH[k], vehMat, n); vLo[k]=new THREE.InstancedMesh(VEH_LO[k], vehMat, n); }
+const TRAFFIC_MESHES=[...Object.values(vHi),...Object.values(vLo)]; App._r.trainCab=trainCab; App._r.vHi=vHi; App._r.LANES=()=>LANES;
 TRAFFIC_MESHES.forEach(m=>{ m.castShadow=true; m.frustumCulled=false; for(let i=0;i<m.count;i++) setInst(m,i,0,-9999,0,0,0,0); scene.add(m); });
 /* Right-hand traffic. Each road has lanes per direction; the outer lane of the main road is kept free for the Hajj bus you ride.
    Every lane is a queue: a vehicle never closes within a safe gap of the one ahead, so nothing passes through anything. */
@@ -4884,17 +5344,16 @@ ROADS.forEach((r,ri)=>{ const offs=laneOffsets(r.w); for(const d of [1,-1]) offs
   const player = r.main && k===n-1, bus = !player && k===(r.main?n-2:n-1);
   LANES.push({r, curve:BUS_ROADS[ri], len:r.len, d, off, player, bus, veh:[]}); }); });
 const PLAYER_LANE_OFF = laneOffsets(mainRoad.w).slice(-1)[0];
-{ const bc=new THREE.Color(), BC=[0xf4f4f2,0xf4f4f2,0x2f8f6a,0x3d6fb0,0xe9e2cf], CCv=[0xf6f6f4,0xf6f6f4,0xf6f6f4,0xc9ccd0,0x8d9298,0x2c3138,0x6e1f22,0xd9d2c0,0xf6f6f4,0x1f3c5c];
-  const cnt={}; for(const k in carHi) cnt[k]=0;
+{ const bc=new THREE.Color(), BC=[0xf4f4f2,0xf4f4f2,0xece6d8,0xf4f4f2,0xe9e2cf], CCv=[0xf6f6f4,0xf6f6f4,0xf6f6f4,0xc9ccd0,0x8d9298,0x2c3138,0x6e1f22,0xd9d2c0,0xf6f6f4,0x1f3c5c];
+
   const fill=(lanes, total, bus, len, vmin, vmax, palette)=>{ const tot=lanes.reduce((a,l)=>a+l.len,0); let idx=0;
     lanes.forEach((l,li)=>{ const n = li===lanes.length-1 ? total-idx : Math.round(total*l.len/tot); const gap=l.len/Math.max(1,n);
-      for(let j=0;j<n && idx<total;j++,idx++){ const v=rnd(vmin,vmax); let hi, i, lo=bus?busesLow:carsLow;
-        if(bus){ hi=buses; i=idx; } else { const k=CAR_KINDS[idx%CAR_KINDS.length]; hi=carHi[k]; i=cnt[k]++; }
-        const L2=bus?len:(hi===carHi.van?5.5:hi===carHi.pickup||hi===carHi.suv?5.3:4.9);
-        l.veh.push({s:j*gap+rnd(0,gap*.35), v0:v, v, len:L2, hi, i, lo, j:idx, col:new THREE.Color(palette[idx%palette.length])}); bc.set(palette[idx%palette.length]); hi.setColorAt(i,bc); lo.setColorAt(idx,bc); } }); };
+      for(let j=0;j<n && idx<total;j++,idx++){ const v=rnd(vmin,vmax); const fam=bus?BUS_KEYS:CAR_KEYS, k=fam[Math.floor(rand()*fam.length)], hi=vHi[k], lo=vLo[k];
+        const L2=VEH[k].userData.len+(bus?.2:.4);
+        l.veh.push({s:j*gap+rnd(0,gap*.35), v0:v, v, len:L2, hi, i:0, lo, j:idx, col:new THREE.Color(palette[idx%palette.length])}); } }); };
   fill(LANES.filter(l=>l.bus), BUSN, true, 12.4, 9, 12, BC);
   fill(LANES.filter(l=>!l.bus && !l.player), CARN, false, 4.6, 11, 16, CCv);
-  for(const k in carHi) carHi[k].count=Math.max(1,cnt[k]); }
+  TRAFFIC_MESHES.forEach(m=>{ m.count=0; m.setColorAt(0,bc.set(0xffffff)); }); }
 const _tp=new THREE.Vector3(), _tt=new THREE.Vector3();
 const _tc=new Map();
 function updateTraffic(dtS){ _tc.clear(); const slot=m=>{ const k=_tc.get(m)||0; _tc.set(m,k+1); return k; };
@@ -5221,8 +5680,13 @@ function instAt(g, geo, mat, items, cast=true){ const im=new THREE.InstancedMesh
   items.forEach((t,i)=>{ setInst(im,i,t[0],t[1],t[2],t[4]??1,t[5]??t[4]??1,t[6]??t[4]??1,t[3]||0); }); im.castShadow=cast; im.receiveShadow=true; g.add(im); return im; }
 /* parked vehicles: full models nearby, simple boxes from a distance */
 const VEH_LOD=[]; let vehLodT=0;
-function vehAt(g, geo, items, palette){ const im=instAt(g, geo, vehMat, items); const c=new THREE.Color(); items.forEach((t,i)=>{ c.set(palette[i%palette.length]); im.setColorAt(i,c); });
-  const lg= geo===VEH.coach?VEH.coachLow : [VEH.sedan,VEH.suv,VEH.pickup,VEH.van].includes(geo)?VEH.carLow : null;
+/* parked vehicles: a car or coach request is shared out at random over the whole family (all ten cars, the three coaches) */
+function vehAt(g, geo, items, palette){ const key=VEH_KEY.get(geo), fam=CAR_KEYS.includes(key)?CAR_KEYS:BUS_KEYS.includes(key)?BUS_KEYS:null;
+  if(fam && items.length>1){ const grp={}; items.forEach((t,i)=>{ const k=fam[Math.floor(rand()*fam.length)]; (grp[k]=grp[k]||{it:[],pal:[]}).it.push(t); grp[k].pal.push(palette[i%palette.length]); });
+    let im=null; for(const k in grp) im=vehAt1(g, k, grp[k].it, grp[k].pal); return im; }
+  return vehAt1(g, key, items, palette, geo); }
+function vehAt1(g, key, items, palette, geo){ geo=geo||VEH[key]; const im=instAt(g, geo, vehMat, items); const c=new THREE.Color(); items.forEach((t,i)=>{ c.set(palette[i%palette.length]); im.setColorAt(i,c); });
+  const lg=key?VEH_LO[key]:null;
   if(lg && items.length){ const lo=instAt(g, lg, vehMat, items, false); items.forEach((t,i)=>{ c.set(palette[i%palette.length]); lo.setColorAt(i,c); }); lo.visible=false;
     let cx=0, cz=0, r=0; items.forEach(t=>{ cx+=t[0]; cz+=t[2]; }); cx/=items.length; cz/=items.length; items.forEach(t=>{ r=Math.max(r,Math.hypot(t[0]-cx,t[2]-cz)); });
     VEH_LOD.push({hi:im, lo, g, c:new THREE.Vector3(cx,0,cz), r}); }
@@ -5230,7 +5694,7 @@ function vehAt(g, geo, items, palette){ const im=instAt(g, geo, vehMat, items); 
 const _vl=new THREE.Vector3();
 function vehLodUpdate(){ if((vehLodT++)%20) return; const p=FPS.on?FPS.pos:camera.position;
   for(const L of VEH_LOD){ _vl.copy(L.c).applyMatrix4(L.g.matrixWorld); const near=Math.hypot(_vl.x-p.x,_vl.z-p.z)<L.r+260 && p.y-_vl.y<400; L.hi.visible=near; L.lo.visible=!near; } }
-const COACH_COL=[0xf4f4f2,0xf4f4f2,0xe9e2cf,0x2f8f6a,0xf4f4f2,0x3d6fb0,0xf4f4f2];
+const COACH_COL=[0xf4f4f2,0xf4f4f2,0xe9e2cf,0xf4f4f2,0xece6d8,0xf4f4f2];
 function peopleAt(g, pts){ const cr=new Crowd(pts.length, g); pts.forEach(([x,y,z,r],i)=>cr.set(i,x,y,z,r??rand()*6.28)); cr.commit(); return cr; }
 function lampMasts(g, pts, h=22){ const pole=instAt(g, new THREE.CylinderGeometry(.18,.3,h,8).translate(0,h/2,0), SM.steel, pts.map(([x,z])=>[x,0,z]));
   const head=instAt(g, new THREE.BoxGeometry(2.4,.4,.9).translate(0,h,0), glow(M(0xdcdcdc),0xffe6b0,2.4), pts.map(([x,z])=>[x,0,z]), false); return [pole,head]; }
@@ -5948,9 +6412,10 @@ hpSite("balad", 1200, (g,F)=>{ slab(g,520,440,0,0,M(0xcfc3ad,{roughness:1}),.04,
 /* go there: walk for places on foot, the drone over mountains, battlefields and far areas */
 const HP_LINK={haram:"haram", nabawi:"nabawi", quba:"quba", qiblatayn:"qiblatayn", shuhada:"shuhada", ibnAbbas:"ibnAbbas", namirah:null, uhud:null, sevenM:"fath"};
 App.hpGo=(id,mode)=>{ const H=HPT[HP_LINK[id]&&HPT[HP_LINK[id]]?HP_LINK[id]:id]||HPT[id]; if(!H) return; ensureNear(H.x,H.z,2500); const I=islandAt(H.x,H.z); if(I) ensureSite("isl_"+I.id);
-  if(id==="haram"){ if(DRONE.on) droneExit(); if(!FPS.on) App.enterFPS("haram"); return; }
+  /* the Haram walk starts at its own gate; entering walk mode only sets that pose the first time, so set it every time */
+  if(id==="haram" && mode!=="drone"){ if(DRONE.on) droneExit(); if(!FPS.on) App.enterFPS("haram"); placeAt(startPose("haram")); applyCam(); rtFlush(camera.position,2500); sitesUpdate(true); cellsUpdate(true); App.aqHold(4); return; }
   const air=mode==="drone" || ["hira","thawr","uhud","zubaydah","badr","khaybar","hegra","alula","ahsa","turaif","dhat"].includes(id) && mode!=="walk";
-  const d=(HPB[id]&&HPB[id].view)||200;
+  const d=(HPB[id]&&HPB[id].view)||(id==="haram"||id==="nabawi"?650:200);
   if(air){ if(!DRONE.on) droneEnter(); const D=DRONE; D.pos.set(H.x-d*.45, H.y+d*.42, H.z+d*.6); D.yaw=Math.atan2(-.45,.6); D.pitch=-.4; camera.position.copy(D.pos); }
   else { if(DRONE.on) droneExit(); if(!FPS.on) App.enterFPS("haram"); const R0=Math.min(80,d*.35), free=(x,z)=>!solid(x,z)&&!solid(x+1.2,z)&&!solid(x-1.2,z)&&!solid(x,z+1.2)&&!solid(x,z-1.2); let sx=H.x, sz=H.z+R0;
     if(HPB[id]&&HPB[id].start){ const [a,b]=HPB[id].start; sx=H.x+a; sz=H.z+b; } else
@@ -6384,10 +6849,10 @@ function planeFlightCabin(){ const g=planeCabin();
   const wing=new THREE.Shape(); wing.moveTo(0,4.5); wing.lineTo(0,-5.2); wing.lineTo(-29,-17.5); wing.lineTo(-30.2,-19.2); wing.lineTo(-31,-17.6); wing.lineTo(-2,6.2); wing.lineTo(0,4.5);
   const wg=new THREE.ExtrudeGeometry(wing,{depth:.55,bevelEnabled:true,bevelThickness:.12,bevelSize:.12,bevelSegments:1}); wg.rotateX(Math.PI/2);
   const p=wg.attributes.position; for(let i=0;i<p.count;i++) p.setY(i,p.getY(i)+Math.abs(p.getX(i))*.085); wg.computeVertexNormals();
-  const w=new THREE.Mesh(wg, M(0xe3e6ea,{roughness:.45, metalness:.3, side:THREE.DoubleSide})); w.position.set(-2.6,-1.6,-2); g.add(w);
-  const eng=new THREE.Mesh(new THREE.CylinderGeometry(1.75,1.55,6.2,24).rotateX(Math.PI/2), M(0xf2f2f0,{roughness:.4, metalness:.2})); eng.position.set(-9.6-2.6,-3.0,-1); g.add(eng);
-  const tip=glow(new THREE.MeshStandardMaterial({color:0x22ff66, emissive:0x22ff66, emissiveIntensity:.8}),0x22ff66,2); const lt=new THREE.Mesh(new THREE.SphereGeometry(.18,8,6), tip); lt.position.set(-33.4,1.2,-19.6); g.add(lt);
-  g.userData.eye=[-2.36,1.16,-3.8]; g.userData.lift=0; return g; }
+  const w=new THREE.Mesh(wg, M(0xe3e6ea,{roughness:.45, metalness:.3, side:THREE.DoubleSide})); w.scale.set(.56,1,.62); w.position.set(-1.75,-1.3,-1.6); g.add(w);
+  const eng=new THREE.Mesh(new THREE.CylinderGeometry(1.0,.88,3.7,24).rotateX(Math.PI/2), M(0x1f6b49,{roughness:.4, metalness:.2})); eng.position.set(-5.8,-2.35,.2); g.add(eng);
+  const tip=glow(new THREE.MeshStandardMaterial({color:0x22ff66, emissive:0x22ff66, emissiveIntensity:.8}),0x22ff66,2); const lt=new THREE.Mesh(new THREE.SphereGeometry(.18,8,6), tip); lt.position.set(-19.1,1.4,-12.6); g.add(lt);
+  g.userData.eye=[-1.3,1.16,-3.8]; g.userData.lift=0; return g; }
 function shipDeck(){ const g=new THREE.Group(); g.visible=false; scene.add(g); const m=new THREE.Mesh(VEH.ship, vehMat); m.castShadow=true; m.receiveShadow=true; g.add(m);
   for(const sd of [-1,1]){ const rail=new THREE.Mesh(new THREE.BoxGeometry(.08,1.1,26), M(0xdcdcdc,{metalness:.6, roughness:.3})); rail.position.set(sd*6.2,16.1,58); rail.rotation.y=sd*.18; g.add(rail); }
   g.userData.eye=[3.2,17.1,56]; g.userData.lift=-5; return g; }
@@ -6406,13 +6871,13 @@ function nearestIdx2(S,[x,z]){ let b=0, bd=1e18; for(let i=0;i<S.length;i++){ co
 function smoothPath(P, win){ const n=P.length, ys=P.map(p=>p.y), out=P.map(p=>({...p})); for(let i=0;i<n;i++){ let a=0,c=0; for(let k=-win;k<=win;k++){ const j=clamp(i+k,0,n-1); a+=ys[j]; c++; } out[i].y=a/c; } return out; }
 
 /* ---------- traffic sharing the road with your coach ---------- */
-const RT_KINDS=["sedan","suv","coach","pickup","sedan","suv","van"];
+const RT_KINDS=[...CAR_KEYS.slice(0,5),"bus0",...CAR_KEYS.slice(5),"bus1","bus2"];
 const RTRAF={ meshes:{}, list:[], on:false };
 for(const k of new Set(RT_KINDS)){ const m=new THREE.InstancedMesh(VEH[k], vehMat, 12); m.count=0; m.frustumCulled=false; m.castShadow=true; scene.add(m); RTRAF.meshes[k]=m; }
 function rtrafStart(R){ RTRAF.list=[]; RTRAF.on=true; const cnt={}; for(const k in RTRAF.meshes){ cnt[k]=0; }
   const lanes=R.lanes||[[1,6.3],[1,10],[-1,6.3],[-1,10],[-1,13.8]]; const c=new THREE.Color(), pal=[0xf6f6f4,0xf6f6f4,0xc9ccd0,0x2c3138,0x6e1f22,0xd9d2c0,0x1f3c5c];
   for(let i=0;i<26;i++){ const k=RT_KINDS[i%RT_KINDS.length]; if(cnt[k]>=12) continue; const [dir,off]=lanes[i%lanes.length];
-    const v={kind:k, i:cnt[k]++, dir, off, ds:rnd(-1100,1100), v:dir>0?rnd(-5,4):rnd(22,30)}; if(Math.abs(v.ds)<30 && dir>0 && off===R.lane) v.ds+=90; RTRAF.list.push(v); c.set(k==="coach"?COACH_COL[i%COACH_COL.length]:pal[i%pal.length]); RTRAF.meshes[k].setColorAt(v.i,c); }
+    const v={kind:k, i:cnt[k]++, dir, off, ds:rnd(-1100,1100), v:dir>0?rnd(-5,4):rnd(22,30)}; if(Math.abs(v.ds)<30 && dir>0 && off===R.lane) v.ds+=90; RTRAF.list.push(v); c.set(BUS_KEYS.includes(k)?COACH_COL[i%COACH_COL.length]:pal[i%pal.length]); RTRAF.meshes[k].setColorAt(v.i,c); }
   for(const k in RTRAF.meshes){ RTRAF.meshes[k].count=cnt[k]; if(RTRAF.meshes[k].instanceColor) RTRAF.meshes[k].instanceColor.needsUpdate=true; } }
 function rtrafStop(){ RTRAF.on=false; for(const k in RTRAF.meshes) RTRAF.meshes[k].count=0; }
 const _rp=new THREE.Vector3(), _rq=new THREE.Vector3();
@@ -6558,11 +7023,11 @@ function mosqueAnchors(key){ ensureSite(key); const S=SITES[key], p=padOf(key), 
   const m=S.group.children.find(o=>o.isGroup); const d=(m&&m.children[0]&&m.children[0].geometry.parameters.depth)||100;
   return {door:{x:x-ux*(d/2+14), z:z-uz*(d/2+14)}, park:{x:x-(p.hx-34), z:z+(p.hz-26)}, c:{x,z}}; }
 function gateCabin(F, lx, lz, rot){ const g=cabinFor("planeGate"); const [x,z]=fw(F,lx,lz); g.position.set(x,F.y+2.2,z); g.rotation.set(0,F.r+rot,0); g.updateMatrixWorld(true); g.visible=true;
-  const C=frame(x,z,F.y+2.2,F.r+rot); const cols=[[0,-1.92,0,.5,14],[0,0,0,.3,14],[0,1.92,0,.5,14],[0,-2.75,0,.1,15.5],[0,2.75,0,.1,15.5],[0,0,15.4,2.8,.1],[0,0,-15.4,2.8,.1]].map(([_,lx2,lz2,hx,hz])=>{ const [wx,wz]=fw(C,lx2,lz2); const c={t:0,x:wx,z:wz,hx,hz,c:Math.cos(C.r),s:Math.sin(C.r),r:Math.hypot(hx,hz)}; COLL.push(c); if(COLL_LIVE) COLL_LIVE(c); return c; });
-  const fl={x,z,hx:2.8,hz:15.5,c:Math.cos(C.r),s:Math.sin(C.r),y:F.y+2.2,r:16}; FLOORS.push(fl);
+  const C=frame(x,z,F.y+2.2,F.r+rot); const cols=[[0,-1.08,0,.6,14],[0,1.08,0,.6,14],[0,-1.92,0,.1,15.5],[0,1.92,0,.1,15.5],[0,0,15.4,1.9,.1],[0,0,-15.4,1.9,.1]].map(([_,lx2,lz2,hx,hz])=>{ const [wx,wz]=fw(C,lx2,lz2); const c={t:0,x:wx,z:wz,hx,hz,c:Math.cos(C.r),s:Math.sin(C.r),r:Math.hypot(hx,hz)}; COLL.push(c); if(COLL_LIVE) COLL_LIVE(c); return c; });
+  const fl={x,z,hx:1.9,hz:15.5,c:Math.cos(C.r),s:Math.sin(C.r),y:F.y+2.2,r:16}; FLOORS.push(fl);
   const hush=COLL.filter(c=>c.t===0 && !c.off && c.hz>=30 && Math.hypot(c.x-x,c.z-z)<12); hush.forEach(c=>c.off=true);
   const off=()=>{ g.visible=false; cols.forEach(c=>c.off=true); hush.forEach(c=>c.off=false); const i=FLOORS.indexOf(fl); if(i>=0) FLOORS.splice(i,1); }; QTMP.push(off);
-  return {spawn:W(C,.9,10.5), door:W(C,2.1,14.2), fwd:W(C,.9,30), off}; }
+  return {spawn:W(C,0,10.5), door:W(C,1.3,14.6), fwd:W(C,0,30), off}; }
 function concatPath(parts){ const out=[]; for(const P of parts){ const base=out.length?out[out.length-1].s:0, o0=out.length?Math.hypot(P[0].x-out[out.length-1].x,P[0].z-out[out.length-1].z):0; P.forEach((p,i)=>out.push({x:p.x,y:p.y,z:p.z,s:base+o0+p.s})); } return out; }
 function coachSpec(legs, o){ const lane=13.8, parts=legs.map(([k,a,b])=>{ const S=ROUTES[k].S, i0=a==null?0:(typeof a==="number"?a:routeIdx(k,a)), i1=b==null?S.length-1:(typeof b==="number"?b:routeIdx(k,b)); const ln=ROUTES[k].w>=28?13.8:(k==="hada"?3.75:9.5); return pathFromRoute(S,i0,i1,ln); });
   const P=concatPath(parts), L=P[P.length-1].s, fix=a=>[clamp(a[0]<0?L+a[0]:a[0],0,L),clamp(a[1]<0?L+a[1]:a[1],0,L),a[2],a[3],a[4]];
