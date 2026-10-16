@@ -2939,6 +2939,9 @@ import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 import { LineGeometry } from "three/addons/lines/LineGeometry.js";
 import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { GTAOPass } from "three/addons/postprocessing/GTAOPass.js";
+import { GTAOShader } from "three/addons/shaders/GTAOShader.js";
+import { PoissonDenoiseShader } from "three/addons/shaders/PoissonDenoiseShader.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
 import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
 import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
@@ -3261,6 +3264,9 @@ catch(e){ const b=document.getElementById("bootStep"); if(b) b.textContent=App.t
 const HQ = !matchMedia("(pointer:coarse)").matches && (navigator.deviceMemory||8)>=4 && (navigator.hardwareConcurrency||8)>=4; App.HQ=HQ;
 const PR_MAX = Math.min(devicePixelRatio||1, HQ?2:1.5); let PR = PR_MAX;
 renderer.setPixelRatio(PR);
+/* light balance: the sky's image-based fill is kept low so faces turned from the sun read darker than lit ones */
+const QP=new URLSearchParams(location.search), ENVK=+(QP.get("envk")||.4), HEMIK=+(QP.get("hemik")||.6), ALB=+(QP.get("alb")||.84);
+for(const k of ["envmap_physical_pars_fragment"]) THREE.ShaderChunk[k]=THREE.ShaderChunk[k].split("envMapColor.rgb * envMapIntensity;").join("envMapColor.rgb * envMapIntensity * "+ENVK.toFixed(3)+";");
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 0.5;
 renderer.shadowMap.enabled = true;
@@ -3287,7 +3293,11 @@ scene.add(sun, sun.target);
 const NIGHT = {value:0};
 const glowMats=[];
 function glow(mat, color, k){ mat.emissive=new THREE.Color(color); mat.emissiveIntensity=0; glowMats.push({mat,k}); return mat; }
-function M(color, o={}){ return new THREE.MeshStandardMaterial(Object.assign({color, roughness:.85, metalness:0}, o)); }
+/* near-white paints are held a little below pure white so sunlit and shaded faces stay apart after tone mapping */
+const _mc=new THREE.Color();
+function M(color, o={}){ if(typeof color==="number" && color!==0xffffff){ _mc.setHex(color); const mx=Math.max(_mc.r,_mc.g,_mc.b); const lim=Math.pow(ALB,2.2);
+    if(mx>lim){ _mc.multiplyScalar(lim/mx); color=_mc.getHex(); } }
+  return new THREE.MeshStandardMaterial(Object.assign({color, roughness:.85, metalness:0}, o)); }
 
 /* Facade shader: floors, windows or arches drawn from world position, lit windows at night. */
 function facadeMat(o){
@@ -6016,7 +6026,7 @@ function stepSky(k){
   cur.sun.lerp(_c.set(skyT.sun),k); cur.fog.lerp(_c.set(skyT.fog),k);
   skyU.sunPosition.value.copy(dirFrom(cur.el,cur.az)); skyU.turbidity.value=cur.tur; skyU.rayleigh.value=cur.ray; skyU.mieCoefficient.value=.0035; skyU.mieDirectionalG.value=.82;
   lightDir.copy(dirFrom(cur.lel,cur.laz));
-  sun.color.copy(cur.sun); sun.intensity=cur.si; hemi.intensity=cur.hemi;
+  sun.color.copy(cur.sun); sun.intensity=cur.si; hemi.intensity=cur.hemi*HEMIK;
   renderer.toneMappingExposure=cur.exp; scene.fog.color.copy(cur.fog); scene.fog.density=cur.fd*FOGK;
   NIGHT.value=cur.night; starMat.opacity=clamp((cur.night-.45)/.55,0,1);
   glowMats.forEach(g=>{ if(g.opacity) g.mat.opacity=cur.night*g.k; else g.mat.emissiveIntensity=cur.night*g.k; });
@@ -7045,6 +7055,24 @@ App.drone={enter:droneEnter, exit:droneExit, state:DRONE, update:droneUpdate};
 /* ---------- post-processing & layout ---------- */
 const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(innerWidth*PR, innerHeight*PR, {type:THREE.HalfFloatType, samples:/[?&]aa=0/.test(location.search)?0:(HQ?4:2)}));
 composer.addPass(new RenderPass(scene, camera));
+/* ambient occlusion (darkens corners, contact lines and overlaps); the pass is taught to read the logarithmic depth buffer */
+let gtao=null;
+if((HQ || /[?&]ao=1/.test(location.search)) && !/[?&]ao=0/.test(location.search)){
+  const LF=Math.log2(camera.far+1).toFixed(6);
+  const VP=`vec3 getViewPosition(const in vec2 screenPosition, const in float depth) {
+    float w = exp2(depth * ${LF}) - 1.0;
+    vec4 p = cameraProjectionMatrixInverse * vec4(screenPosition * 2.0 - 1.0, -1.0, 1.0); p.xyz /= p.w;
+    return p.xyz * (w / -p.z);
+  }`;
+  GTAOShader.fragmentShader=GTAOShader.fragmentShader.replace("ao = clamp(ao / float(DIRECTIONS), 0., 1.);","ao = clamp(ao / float(DIRECTIONS), 0., 1.); ao = mix(ao, 1.0, smoothstep(220.0, 650.0, -viewPos.z));");
+  for(const S of [GTAOShader, PoissonDenoiseShader]) S.fragmentShader=S.fragmentShader.replace(/vec3 getViewPosition\(const in vec2 screenPosition, const in float depth\) \{[\s\S]*?return viewSpacePosition\.xyz \/ viewSpacePosition\.w;\s*\}/, VP);
+  gtao=new GTAOPass(scene, camera, innerWidth*PR, innerHeight*PR, undefined,
+    {radius:3.2, distanceExponent:1.6, thickness:4, scale:1.25, samples:16, distanceFallOff:1, screenSpaceRadius:false},
+    {lumaPhi:10, depthPhi:2, normalPhi:3, radius:6, radiusExponent:1, rings:2, samples:16});
+  gtao.blendIntensity=+(QP.get("aok")||.9);
+  gtao.overrideVisibility=function(){ const c=this._visibilityCache; this.scene.traverse(o=>{ c.set(o,o.visible); const m=o.material;
+    if(o.isPoints||o.isLine||o.isSprite||(m&&(m.transparent||m.alphaTest>0||m.isShaderMaterial||m.isSpriteMaterial))) o.visible=false; }); };
+  composer.addPass(gtao); App._gtao=gtao; }
 const bloom = new UnrealBloomPass(new THREE.Vector2(256,256), .2, .55, 2); composer.addPass(bloom);
 composer.addPass(new OutputPass());
 const fxaa=new ShaderPass(FXAAShader); fxaa.enabled=false; composer.addPass(fxaa);
@@ -7180,7 +7208,7 @@ const AQ={ lvl:0, t:0, f:0, hold:4, win:[], fixed:/[?&]aa=0/.test(location.searc
 const AQ_LV=[ {pr:PR_MAX, aa:HQ?4:2, sh:1, rt:HQ?6:4}, {pr:PR_MAX, aa:2, sh:2, rt:HQ?5:4}, {pr:PR_MAX, aa:2, sh:3, rt:3}, {pr:Math.max(1,Math.min(PR_MAX,1.5)), aa:2, sh:3, rt:3}, {pr:Math.max(1,Math.min(PR_MAX,1.25)), aa:2, sh:4, rt:2} ];
 function aqApply(){ const L=AQ_LV[AQ.lvl]; PR=L.pr; const aa=AQ.fixed?0:L.aa;
   for(const rt of [composer.renderTarget1, composer.renderTarget2]) if(rt.samples!==aa){ rt.samples=aa; rt.dispose(); }
-  fxaa.enabled = aa===0; RT.budget=L.rt; layout(); AQ.hold=2; AQ.win.length=0; }
+  fxaa.enabled = aa===0; RT.budget=L.rt; if(gtao) gtao.enabled=AQ.lvl===0; layout(); AQ.hold=2; AQ.win.length=0; }
 App.aqHold=(s=3)=>{ AQ.hold=Math.max(AQ.hold,s); AQ.win.length=0; };
 function aqFrame(dt){ // judge by the median of the last ~2 s; hitches from building a place or compiling shaders are ignored
   if(document.hidden || dt<=0) return; if(AQ.hold>0){ AQ.hold-=dt; return; } const ms=dt*1000; if(ms>90) return;
